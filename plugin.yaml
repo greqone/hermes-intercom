@@ -1,0 +1,42 @@
+name: hermes-intercom
+version: 0.1.0
+description: >
+  Cross-session discovery and inter-agent messaging for Hermes Agent (Desktop,
+  TUI, CLI, and messaging channels). Discovers sessions via read-only state.db,
+  auto-mounts dormant local sessions via the profile gateway authority when
+  needed, and delivers attributed agent cards through ctx.inject_message with
+  multi-hop loop protection and deduplication.
+author: GreQ, Hermes Agent
+license: MIT
+requires_hermes: ">=0.22.5"
+tags: [intercom, sessions, multi-agent, messaging, automation]
+provides_tools:
+  - session_list
+  - session_send
+provides_hooks:
+  - pre_llm_call
+config_schema:
+  max_hops:
+    type: int
+    default: 3
+    description: Maximum autonomous intercom hops before requiring a human turn
+  dedup_window_seconds:
+    type: int
+    default: 120
+    description: Seconds within which an identical message to the same target is dropped
+  burst_window_seconds:
+    type: int
+    default: 600
+    description: Sliding window in seconds for per-target rate limiting
+  max_messages_per_window:
+    type: int
+    default: 10
+    description: Maximum intercom messages allowed to one target within burst_window_seconds
+  auto_mount_dormant:
+    type: bool
+    default: true
+    description: Automatically mount a dormant local session in the gateway authority before injecting
+  mount_timeout_seconds:
+    type: float
+    default: 8.0
+    description: Timeout in seconds for mounting a dormant local session over the gateway WebSocket
