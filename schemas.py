@@ -5,8 +5,14 @@ SESSION_LIST_SCHEMA: dict = {
     "name": "session_list",
     "description": (
         "List active or recent Hermes sessions in this profile (Desktop, CLI, TUI, Discord, Telegram) "
-        "that can be messaged with session_send. Returns session_id, title, source, cwd, model, "
-        "session_key, message_count, addressable, and is_self, ordered by most recent activity."
+        "that can be messaged with session_send, ordered by most recent activity. Each entry returns "
+        "session_id, root_session_id, title, source, model, cwd, session_key, message_count, "
+        "last_activity_at, addressable, routed, and is_self. "
+        "`addressable` is true when the entry has a gateway session_key (explicit, from the routing "
+        "table, or synthesized). `routed` is true only when a real route exists — an explicit "
+        "session_key or a gateway_routing row — and is false when the key was merely synthesized as "
+        "`agent:<namespace>:local:dm:<session_id>`; such a session must be mounted in the gateway "
+        "authority before a send is accepted."
     ),
     "parameters": {
         "type": "object",
@@ -61,8 +67,8 @@ SESSION_SEND_SCHEMA: dict = {
             "expect_reply": {
                 "type": "boolean",
                 "description": (
-                    "When true, instructs the target session how to reply back to this session via session_send. "
-                    "When false (default), marks the message as FYI unless the message asks a question."
+                    "When true, marks the card as mode=reply and instructs the target session how to "
+                    "reply back via session_send. When false (default), marks the card as mode=fyi."
                 ),
                 "default": False,
             },

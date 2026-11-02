@@ -50,8 +50,9 @@ def _clear_delivery_state() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_intercom_delivery_state():
-    """Isolate per-home dedup buckets and turn-hop memory between tests."""
+def _reset_intercom_delivery_state(monkeypatch: pytest.MonkeyPatch):
+    """Isolate per-home dedup buckets, turn-hop memory, and the ambient session key between tests."""
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     _clear_delivery_state()
     yield
     _clear_delivery_state()
