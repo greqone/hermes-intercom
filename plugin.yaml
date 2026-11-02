@@ -19,18 +19,26 @@ config_schema:
   max_hops:
     type: int
     default: 3
+    minimum: 1
+    maximum: 10
     description: Maximum autonomous intercom hops before requiring a human turn
   dedup_window_seconds:
     type: int
     default: 120
+    minimum: 0
+    maximum: 3600
     description: Seconds within which an identical message to the same target is dropped
   burst_window_seconds:
     type: int
     default: 600
+    minimum: 1
+    maximum: 86400
     description: Sliding window in seconds for per-target rate limiting
   max_messages_per_window:
     type: int
     default: 10
+    minimum: 1
+    maximum: 200
     description: Maximum intercom messages allowed to one target within burst_window_seconds
   auto_mount_dormant:
     type: bool
@@ -39,4 +47,6 @@ config_schema:
   mount_timeout_seconds:
     type: float
     default: 8.0
+    minimum: 1.0
+    maximum: 60.0
     description: Timeout in seconds for mounting a dormant local session over the gateway WebSocket

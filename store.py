@@ -5,12 +5,26 @@ import json
 import os
 import re
 import sqlite3
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
-INTERCOM_TAG_RE = re.compile(
+# Minimum accepted session_id prefix length for target resolution.
+MIN_ID_PREFIX_LEN = 6
+
+# Characters that must never reach a Desktop agent card sender label.
+_SENDER_STRIP_RE = re.compile(r"['\"\[\]\r\n\t\x00-\x1f\x7f]+")
+
+# Cards/tags are parsed only at the START of the text (never inside a user-supplied body).
+INTERCOM_CARD_PREFIX_RE = re.compile(
+    r"^\s*\[Message from agent '[^'\[\]\r\n]{1,64}'\]\s+"
     r"\[intercom\s+from=([^\s\]]+)\s+hop=(\d+)/(\d+)\s+mode=(reply|fyi)\]"
 )
+BARE_INTERCOM_TAG_RE = re.compile(
+    r"^\s*\[intercom\s+from=([^\s\]]+)\s+hop=(\d+)/(\d+)\s+mode=(reply|fyi)\]"
+)
+# Backwards-compatible alias for the primary (full card) pattern.
+INTERCOM_TAG_RE = INTERCOM_CARD_PREFIX_RE
 
 
 def resolve_home(ctx: Any = None) -> Path:
@@ -18,9 +32,6 @@ def resolve_home(ctx: Any = None) -> Path:
         home = getattr(ctx, "home_path", None)
         if home:
             return Path(home).resolve()
-        mgr = getattr(ctx, "_manager", None)
-        if mgr is not None and getattr(mgr, "home_path", None):
-            return Path(mgr.home_path).resolve()
     env_home = os.environ.get("HERMES_HOME")
     if env_home:
         return Path(env_home).resolve()
@@ -54,27 +65,71 @@ def calling_session_key() -> str:
 
 
 def _connect_ro(db_path: Path) -> sqlite3.Connection:
-    uri = f"file:{db_path.as_posix()}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=5.0)
+    """Open state.db read-only through a percent-encoded SQLite URI.
+
+    Encoding keeps ``#``, ``%`` and ``?`` inside directory names from breaking the URI.
+    """
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    encoded = urllib.parse.quote(resolved.as_posix(), safe="/:")
+    con = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True, timeout=5.0)
     con.row_factory = sqlite3.Row
     return con
 
 
-def _load_routing_map(con: sqlite3.Connection) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
-    """Return (session_id -> session_key, session_key -> parsed_entry)."""
+def _load_routing_map(
+    con: sqlite3.Connection, home: Path | None = None
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Return (session_id -> session_key, session_key -> parsed_entry).
+
+    When ``home`` is given, rows carrying a non-empty ``scope`` that differs from
+    ``<home>/sessions`` are ignored (they belong to another profile's store). Databases
+    without ``scope``/``updated_at`` columns fall back to the minimal routing schema.
+    """
     sid_to_key: dict[str, str] = {}
     key_to_entry: dict[str, dict[str, Any]] = {}
-    try:
-        rows = con.execute("SELECT session_key, entry_json FROM gateway_routing").fetchall()
-    except sqlite3.Error:
-        return sid_to_key, key_to_entry
+
+    expected_scope = ""
+    if home is not None:
+        try:
+            expected_scope = str((Path(home) / "sessions").resolve())
+        except OSError:
+            expected_scope = ""
+
+    rows: list[Any] | None = None
+    if expected_scope:
+        try:
+            rows = con.execute(
+                "SELECT scope, session_key, entry_json, updated_at FROM gateway_routing "
+                "ORDER BY COALESCE(updated_at, 0) ASC"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = None
+    if rows is None:
+        try:
+            rows = con.execute("SELECT session_key, entry_json FROM gateway_routing").fetchall()
+        except sqlite3.Error:
+            return sid_to_key, key_to_entry
+
     for r in rows:
-        skey = r["session_key"] or ""
+        try:
+            skey = str(r["session_key"] or "")
+        except (IndexError, KeyError, TypeError):
+            continue
         if not skey:
             continue
+        if expected_scope:
+            try:
+                row_scope = str(r["scope"] or "")
+            except (IndexError, KeyError, TypeError):
+                row_scope = ""
+            if row_scope and row_scope != expected_scope:
+                continue
         try:
             entry = json.loads(r["entry_json"] or "{}")
-        except Exception:
+        except (sqlite3.Error, ValueError):
             entry = {}
         if isinstance(entry, dict):
             key_to_entry[skey] = entry
@@ -95,32 +150,40 @@ def query_sessions(
     limit: int = 20,
     include_cron: bool = False,
     include_archived: bool = False,
+    _max_limit: int = 100,
 ) -> list[dict[str, Any]]:
-    db_path = home / "state.db"
+    db_path = Path(home) / "state.db"
     if not db_path.is_file():
         return []
 
-    limit = max(1, min(int(limit or 20), 100))
+    max_limit = max(1, int(_max_limit or 100))
+    limit = max(1, min(int(limit or 20), max_limit))
     q_norm = (query or "").strip().lower()
     src_norm = (source or "").strip().lower()
 
-    con = _connect_ro(db_path)
+    con: sqlite3.Connection | None = None
+    rows: list[Any] = []
     try:
-        sid_to_key, _ = _load_routing_map(con)
+        con = _connect_ro(db_path)
+        sid_to_key, _ = _load_routing_map(con, home)
         sql = """
             SELECT
                 id, source, model, parent_session_id, started_at, ended_at,
                 end_reason, message_count, cwd, title, archived, hidden,
                 session_key, last_activity_at
             FROM sessions
-            WHERE COALESCE(end_reason, '') != 'compressed'
+            WHERE COALESCE(end_reason, '') NOT IN ('compression', 'compressed')
               AND (parent_session_id IS NULL OR session_key IS NOT NULL)
         """
         rows = con.execute(sql).fetchall()
+    except sqlite3.Error:
+        return []
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
     by_route: dict[str, dict[str, Any]] = {}
+    route_active: dict[str, bool] = {}
     for r in rows:
         sid = str(r["id"] or "")
         if not sid:
@@ -165,10 +228,20 @@ def query_sessions(
             "is_self": is_self,
         }
 
+        item_active = r["ended_at"] is None
         dedup_key = skey or sid
         existing = by_route.get(dedup_key)
-        if existing is None or item["last_activity_at"] >= existing["last_activity_at"]:
+        if existing is None:
             by_route[dedup_key] = item
+            route_active[dedup_key] = item_active
+        else:
+            existing_active = route_active.get(dedup_key, False)
+            if (item_active, item["last_activity_at"]) >= (
+                existing_active,
+                existing["last_activity_at"],
+            ):
+                by_route[dedup_key] = item
+                route_active[dedup_key] = item_active
 
     items = list(by_route.values())
     items.sort(key=lambda x: x["last_activity_at"], reverse=True)
@@ -205,20 +278,24 @@ def resolve_target(
     caller_session_id: str = "",
     caller_session_key: str = "",
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """Resolve target by exact session_id/root_session_id/session_key, >=6-char ID prefix, or unique title substring."""
+    """Resolve target by exact session_id/root_session_id/session_key, >=MIN_ID_PREFIX_LEN-char
+    ID prefix, or unique title substring."""
     needle = (target or "").strip()
     if not needle:
         return None, []
     needle_low = needle.lower()
 
+    # Rank over a much wider window than the public session_list cap so older sessions
+    # remain resolvable by exact id/key, ID prefix, or title.
     all_sessions = query_sessions(
         home,
         ns=ns,
         caller_session_id=caller_session_id,
         caller_session_key=caller_session_key,
-        limit=100,
+        limit=5000,
         include_cron=True,
         include_archived=True,
+        _max_limit=5000,
     )
 
     exact = [
@@ -241,7 +318,7 @@ def resolve_target(
             return active_exact[0], []
         return None, exact[:8]
 
-    if len(needle_low) >= 6:
+    if len(needle_low) >= MIN_ID_PREFIX_LEN:
         prefix_hits = [
             s
             for s in all_sessions
@@ -276,31 +353,36 @@ def lookup_sender_info(
         sid = caller_session_key.rsplit(":", 1)[-1]
 
     title = ""
-    db_path = home / "state.db"
+    db_path = Path(home) / "state.db"
     if sid and db_path.is_file():
-        con = _connect_ro(db_path)
+        con: sqlite3.Connection | None = None
         try:
+            con = _connect_ro(db_path)
             row = con.execute("SELECT title FROM sessions WHERE id = ? LIMIT 1", (sid,)).fetchone()
             if row and row["title"]:
                 title = str(row["title"])
         except sqlite3.Error:
-            pass
+            title = ""
         finally:
-            con.close()
+            if con is not None:
+                con.close()
 
     short_id = sid[:14] if sid.startswith("local-") else (sid[:16] if sid else "unknown")
     return {"session_id": sid or "unknown", "title": title, "short_id": short_id}
 
 
 def parse_hop_from_text(text: str | None) -> int:
+    """Read the hop counter from a card that STARTS the text (never from the body)."""
     if not text or not isinstance(text, str):
         return 0
-    m = INTERCOM_TAG_RE.search(text)
-    if not m:
+    m = INTERCOM_CARD_PREFIX_RE.match(text)
+    if m is None:
+        m = BARE_INTERCOM_TAG_RE.match(text)
+    if m is None:
         return 0
     try:
         return max(0, int(m.group(2)))
-    except ValueError:
+    except (TypeError, ValueError):
         return 0
 
 
@@ -308,11 +390,12 @@ def latest_user_message_hop(home: Path, session_id: str) -> int:
     """Fallback hop reader: check the latest role='user' message in state.db for session_id."""
     if not session_id:
         return 0
-    db_path = home / "state.db"
+    db_path = Path(home) / "state.db"
     if not db_path.is_file():
         return 0
-    con = _connect_ro(db_path)
+    con: sqlite3.Connection | None = None
     try:
+        con = _connect_ro(db_path)
         row = con.execute(
             "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1",
             (session_id,),
@@ -322,14 +405,19 @@ def latest_user_message_hop(home: Path, session_id: str) -> int:
     except sqlite3.Error:
         return 0
     finally:
-        con.close()
+        if con is not None:
+            con.close()
     return 0
 
 
 def sanitize_card_sender(raw_label: str) -> str:
-    """Format a sender name guaranteed to match Desktop's AGENT_MESSAGE_RE (no single quotes, 1..64 chars)."""
-    cleaned = re.sub(r"['\r\n\t]+", " ", str(raw_label or "")).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    """Format a sender name guaranteed to match Desktop's AGENT_MESSAGE_RE.
+
+    Strips quotes, brackets, CR/LF/TAB and control chars, collapses whitespace,
+    falls back to "Hermes Session", and caps the result at 60 chars.
+    """
+    cleaned = _SENDER_STRIP_RE.sub(" ", str(raw_label or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         cleaned = "Hermes Session"
     if len(cleaned) > 60:
@@ -347,21 +435,22 @@ def format_intercom_message(
     message: str,
 ) -> str:
     card_name = sanitize_card_sender(sender_card_name)
+    safe_sid = re.sub(r"[\s\[\]]+", "", str(sender_session_id or "unknown")) or "unknown"
     mode = "reply" if expect_reply else "fyi"
-    tag = f"[intercom from={sender_session_id} hop={hop}/{max_hops} mode={mode}]"
+    tag = f"[intercom from={safe_sid} hop={hop}/{max_hops} mode={mode}]"
     if expect_reply and hop < max_hops:
         hint = (
-            f"Reply requested by session `{sender_session_id}` (hop {hop}/{max_hops}). "
-            f"When done, send your concise reply with `session_send(target=\"{sender_session_id}\", message=\"...\")`."
+            f"Reply requested by session `{safe_sid}` (hop {hop}/{max_hops}). "
+            f"When done, send your concise reply with `session_send(target=\"{safe_sid}\", message=\"...\")`."
         )
     elif expect_reply and hop >= max_hops:
         hint = (
-            f"Message from session `{sender_session_id}` (final autonomous hop {hop}/{max_hops} — "
+            f"Message from session `{safe_sid}` (final autonomous hop {hop}/{max_hops} — "
             f"do not call `session_send` back automatically)."
         )
     else:
         hint = (
-            f"FYI from session `{sender_session_id}` (hop {hop}/{max_hops}). "
+            f"FYI from session `{safe_sid}` (hop {hop}/{max_hops}). "
             f"No automatic reply needed unless asked."
         )
     return f"[Message from agent '{card_name}'] {tag}\n{hint}\n\n{message.strip()}"

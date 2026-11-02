@@ -28,7 +28,7 @@ def register(ctx) -> None:
         emoji="📨",
         **common,
     )
-    ctx.register_hook("pre_llm_call", delivery.on_pre_llm_call)
+    ctx.register_hook("pre_llm_call", lambda **kw: delivery.on_pre_llm_call(ctx=ctx, **kw))
 
     try:
         skills_dir = Path(__file__).parent / "skills"

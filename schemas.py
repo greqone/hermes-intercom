@@ -52,7 +52,7 @@ SESSION_SEND_SCHEMA: dict = {
         "properties": {
             "target": {
                 "type": "string",
-                "description": "Target session_id (full or >=8 char prefix), session_key, or unique title substring.",
+                "description": "Target session_id (full or >=6 char prefix), session_key, or unique title substring.",
             },
             "message": {
                 "type": "string",

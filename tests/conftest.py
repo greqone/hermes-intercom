@@ -40,3 +40,18 @@ class _RepoRootIsNotATestPackage:
 def pytest_configure(config):
     if not config.pluginmanager.has_plugin("hermes-intercom-repo-root"):
         config.pluginmanager.register(_RepoRootIsNotATestPackage(), "hermes-intercom-repo-root")
+
+
+def _clear_delivery_state() -> None:
+    delivery = importlib.import_module(f"{PACKAGE}.delivery")
+    with delivery._LOCK:
+        delivery._RECENT_SENDS.clear()
+        delivery._TURN_HOP.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_intercom_delivery_state():
+    """Isolate per-home dedup buckets and turn-hop memory between tests."""
+    _clear_delivery_state()
+    yield
+    _clear_delivery_state()
