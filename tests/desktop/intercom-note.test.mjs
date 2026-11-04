@@ -326,6 +326,88 @@ test('interactive nodes cloned from the native body forward activation to the na
   life.dispose()
 })
 
+test('attribute-only native updates (thumbnail src swap, text direction) reach the visible card', async () => {
+  const env = setup([FYI])
+  const [root] = env.roots
+  const span = root.querySelector('[data-slot="aui_user-message-text"] [data-slot="aui_directive-text"]:last-child')
+  const img = env.doc.createElement('img')
+  img.setAttribute('src', 'before.png')
+  img.setAttribute('alt', 'screenshot')
+  span.append(img)
+  const { life } = await start(env)
+  const native = root.querySelector(`${NOTE} [data-slot="aui_user-message-text"]`)
+  // React keeps the same nodes and only patches attributes (directive-text.tsx thumbnail swap,
+  // user-message-text.tsx forced text direction).
+  native.querySelector('img').setAttribute('src', 'after.png')
+  native.querySelector('[data-slot="aui_user-inline-text"]').setAttribute('dir', 'rtl')
+  await flush(env.win)
+  assert.equal(root.querySelectorAll(CARD).length, 1, 'no duplicate cards')
+  const body = root.querySelector(`${CARD} [data-part="body"]`)
+  assert.equal(body.querySelector('img')?.getAttribute('src'), 'after.png')
+  assert.equal(body.querySelector('[data-slot="aui_user-inline-text"]')?.getAttribute('dir'), 'rtl')
+  life.dispose()
+})
+
+test('link gestures keep modifiers and middle-click when forwarded to the native original', async () => {
+  const env = setup([FYI])
+  const [root] = env.roots
+  const span = root.querySelector('[data-slot="aui_user-message-text"] [data-slot="aui_directive-text"]:last-child')
+  const link = env.doc.createElement('a')
+  link.setAttribute('href', 'https://example.com/doc')
+  link.textContent = 'doc'
+  const seen = []
+  const record = e => {
+    seen.push({ type: e.type, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey, button: e.button })
+    e.preventDefault()
+  }
+  link.addEventListener('click', record)
+  link.addEventListener('auxclick', record)
+  span.append(link)
+  const { life } = await start(env)
+  const cloned = root.querySelector(`${CARD} [data-part="body"] a`)
+  assert.ok(cloned, 'link is present in the card body')
+  const ctrlClick = new env.win.MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true, button: 0 })
+  cloned.dispatchEvent(ctrlClick)
+  assert.equal(ctrlClick.defaultPrevented, true, 'the clone never navigates by itself')
+  const middle = new env.win.MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })
+  cloned.dispatchEvent(middle)
+  assert.equal(middle.defaultPrevented, true, 'middle-click on the clone is not handled by the clone')
+  assert.deepEqual(seen, [
+    { type: 'click', ctrl: true, meta: false, shift: false, button: 0 },
+    { type: 'auxclick', ctrl: false, meta: false, shift: false, button: 1 }
+  ])
+  life.dispose()
+})
+
+test('session ids the native renderer would mangle (backticks) keep the untouched native note', async () => {
+  const [ODD_FYI, ODD_REPLY, PLAIN] = formatViaPython([
+    { ...base, sender_session_id: 'a``b', hop: 1, expect_reply: false, message: 'Body one.' },
+    { ...base, sender_session_id: 'a`b', hop: 1, expect_reply: true, message: 'Body two.' },
+    { ...base, sender_session_id: 'local-1a2b3c4d', hop: 1, expect_reply: false, message: 'Control body.' }
+  ])
+  const env = setup([ODD_FYI, ODD_REPLY, PLAIN])
+  const before = env.roots.map(r => r.outerHTML)
+  const { life } = await start(env)
+  assert.equal(env.roots[0].outerHTML, before[0], 'mangled id: never shown with a wrong session id')
+  assert.equal(env.roots[1].outerHTML, before[1], 'mangled id: never shown with a wrong session id')
+  assert.ok(cardOf(env.roots[2]), 'positive control still enhanced')
+  assertClean(env.roots[2], 'Control body.')
+  life.dispose()
+})
+
+test('non-BMP sender names within the producer cap are still enhanced', async () => {
+  const [EMOJI] = formatViaPython([
+    { ...base, sender_card_name: '🚀'.repeat(35), hop: 1, expect_reply: false, message: 'Rocket body.' }
+  ])
+  const env = setup([EMOJI])
+  assert.ok(env.roots[0].querySelector(NOTE), 'native renders it as an agent note')
+  const { life } = await start(env)
+  assert.ok(cardOf(env.roots[0]), 'enhanced')
+  assert.equal(cardOf(env.roots[0]).querySelector('[data-part="sender"]').textContent, '🚀'.repeat(35))
+  assertClean(env.roots[0], 'Rocket body.')
+  life.dispose()
+})
+
 test('packaging: single ESM file, public default export, only allowed imports, no HTML sinks', { skip: !existsSync(PLUGIN_PATH) && 'desktop/plugin.js absent (baseline)' }, async () => {
   const plugin = await loadPlugin()
   assert.equal(plugin.id, 'hermes-intercom')

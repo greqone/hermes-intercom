@@ -16,10 +16,13 @@ const NOTE_SELECTOR = '[data-slot="aui_agent-message-note"]'
 const CARD_ATTR = 'data-hermes-intercom-card'
 const HIDDEN_ATTR = 'data-hermes-intercom-hidden'
 
-// Same shape as store.py BARE_INTERCOM_TAG_RE, anchored to the first body character.
-const TAG_RE = /^\[intercom\s+from=([^\s\]]+)\s+hop=(\d{1,4})\/(\d{1,4})\s+mode=(reply|fyi)\]/
-// Native header text is `Message from {sender}`; store.py caps the sender at 60 chars.
-const HEADER_RE = /^Message from ([^'[\]\r\n]{1,64})$/
+// Same shape as store.py BARE_INTERCOM_TAG_RE, anchored to the first body character. Backticks
+// are excluded from the session id: the native inline-code renderer would consume them, so such
+// an id can never be shown faithfully and the note is left native.
+const TAG_RE = /^\[intercom\s+from=([^\s\]`]+)\s+hop=(\d{1,4})\/(\d{1,4})\s+mode=(reply|fyi)\]/
+// Native header text is `Message from {sender}`; store.py caps the sender at 60 code points, the
+// host's AGENT_MESSAGE_RE counts code points too (`u`), so this must not count UTF-16 units.
+const HEADER_RE = /^Message from ([^'\[\]\r\n]{1,64})$/u
 // Native UserMessageText renders `code` spans without their backticks.
 const INLINE_CODE_RE = /(`+)([^`\n][\s\S]*?)\1/g
 
@@ -163,9 +166,10 @@ const S = {
   avatar: 'display:inline-flex;align-items:center;justify-content:center;width:1rem;height:1rem;flex-shrink:0;overflow:hidden;border-radius:9999px;font-size:0.8125rem;line-height:1;',
   sender: 'min-width:0;overflow-wrap:anywhere;color:var(--ui-text-secondary,var(--color-muted-foreground));font-weight:500;',
   badge:
-    'display:inline-flex;align-items:center;padding:0 0.375rem;border:1px solid var(--ui-stroke-secondary);' +
-    'border-radius:9999px;font-size:0.6875rem;line-height:1.125rem;white-space:nowrap;',
-  badgeReply: 'color:var(--ui-accent);border-color:color-mix(in srgb,var(--ui-accent) 45%,transparent);',
+    'display:inline-flex;align-items:center;flex-shrink:0;padding:0 0.375rem;border:1px solid var(--ui-stroke-secondary);' +
+    'border-radius:9999px;font-size:0.6875rem;line-height:1.125rem;white-space:nowrap;' +
+    'color:var(--ui-text-secondary,var(--color-muted-foreground));background:color-mix(in srgb,currentColor 6%,transparent);',
+  badgeReply: 'color:var(--ui-accent);border-color:color-mix(in srgb,var(--ui-accent) 45%,transparent);background:color-mix(in srgb,var(--ui-accent) 10%,transparent);',
   body: 'display:block;min-width:0;overflow-wrap:anywhere;font-size:inherit;line-height:1.5;',
   empty: 'display:block;font-style:italic;color:var(--ui-text-tertiary,var(--color-muted-foreground));',
   meta: 'font-size:0.6875rem;line-height:1.125rem;color:var(--ui-text-tertiary,var(--color-muted-foreground));',
@@ -237,12 +241,28 @@ function renderedText(bodyRoot) {
   return bodyRoot.textContent || ''
 }
 
+/** The tag must sit whole in the first plain text node: if the native renderer turned any part
+ *  of it into code, the rendered text no longer equals what the producer wrote. */
+function tagIsPlain(bodyRoot) {
+  const walker = bodyRoot.ownerDocument.createTreeWalker(bodyRoot, 4 /* NodeFilter.SHOW_TEXT */)
+  const first = walker.nextNode()
+  if (!first || !TAG_RE.test(first.data)) return false
+  const code = first.parentElement && first.parentElement.closest('code,pre')
+  return !code || !bodyRoot.contains(code)
+}
+
+// Gestures the native body reacts to: primary click (with modifiers: Ctrl/⌘-click opens the system
+// browser) and middle-click, which never fires `click` (external-link.tsx handles it on auxclick).
+const FORWARDED_EVENTS = ['click', 'auxclick']
+const OBSERVED_ATTRIBUTES = ['src', 'srcset', 'dir', 'href', 'alt', 'title', 'disabled', 'aria-label', 'aria-hidden']
+
 export function createEnhancer(doc) {
   const owner = `hic-${++ownerSeq}`
   const states = new Map() // note -> { card, map, key }
   const win = doc.defaultView
 
   function forward(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return
     const card = event.currentTarget
     const state = [...states.values()].find(s => s.card === card)
     if (!state) return
@@ -251,14 +271,41 @@ export function createEnhancer(doc) {
     event.preventDefault()
     event.stopPropagation()
     const original = state.map.get(target)
-    if (original && original.isConnected && typeof original.click === 'function') original.click()
+    if (!original || !original.isConnected) return
+    original.dispatchEvent(
+      new win.MouseEvent(event.type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: win,
+        detail: event.detail,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+        button: event.button,
+        buttons: event.buttons
+      })
+    )
+  }
+
+  function listen(card) {
+    for (const type of FORWARDED_EVENTS) card.addEventListener(type, forward)
+  }
+
+  function unlisten(card) {
+    for (const type of FORWARDED_EVENTS) card.removeEventListener(type, forward)
   }
 
   function teardown(note) {
     const state = states.get(note)
     if (!state) return
     states.delete(note)
-    state.card.removeEventListener('click', forward)
+    unlisten(state.card)
     state.card.remove()
     if (note.getAttribute(HIDDEN_ATTR) === owner) {
       note.removeAttribute(HIDDEN_ATTR)
@@ -272,7 +319,7 @@ export function createEnhancer(doc) {
     let parsed = null
     try {
       parts = nativeParts(note)
-      parsed = parts && parseRenderedBody(renderedText(parts.bodyRoot))
+      parsed = parts && tagIsPlain(parts.bodyRoot) ? parseRenderedBody(renderedText(parts.bodyRoot)) : null
     } catch {
       parsed = null
     }
@@ -291,14 +338,14 @@ export function createEnhancer(doc) {
     }
     const addedHidden = existing ? existing.addedHidden : !note.hasAttribute('hidden')
     if (existing) {
-      existing.card.removeEventListener('click', forward)
+      unlisten(existing.card)
       existing.card.remove()
     }
     // Another (stale) instance's card for this note.
     const sibling = note.nextElementSibling
     if (sibling && sibling.hasAttribute(CARD_ATTR)) sibling.remove()
 
-    built.card.addEventListener('click', forward)
+    listen(built.card)
     note.after(built.card)
     note.setAttribute(HIDDEN_ATTR, owner)
     if (!note.hasAttribute('hidden')) note.setAttribute('hidden', '')
@@ -338,7 +385,13 @@ export function createEnhancer(doc) {
   return {
     owner,
     start() {
-      observer.observe(doc.body || doc.documentElement, { childList: true, subtree: true, characterData: true })
+      observer.observe(doc.body || doc.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: OBSERVED_ATTRIBUTES
+      })
       for (const note of doc.querySelectorAll(NOTE_SELECTOR)) process(note)
     },
     dispose() {
