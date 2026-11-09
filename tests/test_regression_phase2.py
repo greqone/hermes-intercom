@@ -47,7 +47,8 @@ def _insert(home: Path, rows: list[tuple]) -> None:
 
 def _send(ctx: RecordingContext, **kwargs) -> dict:
     plugin = _load_plugin()
-    raw = plugin.delivery.tool_session_send(kwargs, ctx=ctx, session_id="local-caller-0001")
+    caller = str(kwargs.pop("caller", "local-caller-0001"))
+    raw = plugin.delivery.tool_session_send(kwargs, ctx=ctx, session_id=caller)
     return json.loads(raw)
 
 
@@ -587,5 +588,411 @@ def test_r3_doubled_bare_directives_are_neutralized() -> None:
     )
     body = rendered.rsplit("\n\n", 1)[-1]
     assert "@diff" not in body and "@staged" not in body
+
+
+def test_r4_unknown_retry_stays_on_the_gateway_when_inject_appears(tmp_path: Path, monkeypatch) -> None:
+    """R4-D01: a lost gateway receipt must not be retried through inject_message.
+
+    The first submit may have reached the peer. Once inject becomes available, the
+    same request_id still goes back to the gateway, and a changed body conflicts.
+    """
+    _home_unused, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls: list[str] = []
+
+    def _ws(*_a, **kwargs):
+        calls.append(kwargs.get("request_id", ""))
+        if len(calls) == 1:
+            ctx._allow_inject = True
+            return False, "TimeoutError"
+        return True, "adm-r4"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk2")
+    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk2")
+    changed = _send(ctx, target="local-target-0001", message="hello!", request_id="op-unk2")
+    assert first["ok"] is False and first["error"] == "delivery_unknown"
+    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
+    assert changed["ok"] is False and changed["error"] == "request_conflict"
+    assert ctx.injected == []
+    assert calls == ["op-unk2", "op-unk2"]
+
+
+def test_r4_confirmed_gateway_send_survives_a_refused_retry(tmp_path: Path, monkeypatch) -> None:
+    """R4-D01: a refused refresh must not delete the confirmed gateway receipt.
+
+    Deleting it lets the next retry deliver a second copy through inject_message.
+    """
+    _home_unused, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls: list[str] = []
+
+    def _ws(*_a, **kwargs):
+        calls.append(kwargs.get("request_id", ""))
+        if len(calls) == 1:
+            return True, "adm-1"
+        if len(calls) == 2:
+            ctx._allow_inject = True
+            return False, "rpc_refused:queue_full"
+        return True, "adm-3"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
+    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
+    third = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    assert second["ok"] is False and second["error"] == "injection_refused"
+    assert third["ok"] is True and third["delivery_method"] == "gateway_ws"
+    assert ctx.injected == []
+    assert calls == ["op-keep", "op-keep", "op-keep"]
+
+
+def _card(plugin, hop: int) -> str:
+    return plugin.store.format_intercom_message(
+        sender_card_name="A", sender_session_id="local-a", hop=hop, max_hops=3,
+        expect_reply=True, message="chain",
+    )
+
+
+def _message(home: Path, session_id: str, content: str, summary: int, has_user_turn: int = 0) -> None:
+    con = sqlite3.connect(str(home / "state.db"))
+    cols = {row[1] for row in con.execute("PRAGMA table_info(messages)")}
+    if "_compressed_summary" not in cols:
+        con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    if "_compressed_summary_has_user_turn" not in cols:
+        con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary_has_user_turn INTEGER DEFAULT 0")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, "
+        "_compressed_summary_has_user_turn) VALUES (?, 'user', ?, 1, ?, ?)",
+        (session_id, content, summary, has_user_turn),
+    )
+    con.commit()
+    con.close()
+
+
+def test_r4_reset_target_is_not_delivered_to_the_new_conversation(tmp_path: Path) -> None:
+    """S-R01: an exact id ended by session_reset must not ride the shared key onward.
+
+    The host dispatcher follows that key into the live conversation. Reporting the old id
+    while injecting the shared key delivers the message to the wrong conversation.
+    """
+    home = _home(tmp_path)
+    key = "agent:main:telegram:dm:example-room"
+    _insert(home, [
+        ("telegram-old", "telegram", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("telegram-new", "telegram", "m", None, 3.0, None, None, 1, "New", 0, key, 5.0),
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+    ])
+    ctx = RecordingContext(home)
+    result = _send(ctx, target="telegram-old", message="hello", request_id="op-stale")
+    assert result["ok"] is False
+    assert result["error"] == "target_not_found"
+    assert ctx.injected == []
+
+
+def test_r4_compression_summary_does_not_reset_the_hop(tmp_path: Path) -> None:
+    """S-R02: a synthetic summary row must not hide the parent's exhausted hop.
+
+    Without the summary the same child is refused at hop 4. With it, the send must
+    still be refused.
+    """
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-parent", "local", "m", None, 1.0, 2.0, "compression", 1, "Parent", 0, "", 2.0),
+        ("local-child", "local", "m", "local-parent", 3.0, None, None, 1, "Child", 0,
+         "agent:main:local:dm:local-child", 4.0),
+        ("local-target-0001", "local", "m", None, 1.0, None, None, 1, "Target", 0,
+         "agent:main:local:dm:local-target-0001", 8.0),
+    ])
+    plugin = _load_plugin()
+    _message(home, "local-parent", _card(plugin, 3), 0)
+    _message(home, "local-child", "Summary of the prior conversation", 1)
+    assert plugin.store.latest_user_message_tag(home, "local-child") == (3, 3)
+    child = _send(
+        RecordingContext(home), target="local-target-0001", message="onward",
+        request_id="op-sum", caller="local-child",
+    )
+    assert child["ok"] is False and child["error"] == "max_hops_exceeded"
+
+
+def test_r4_summary_carrier_with_a_real_ask_is_a_turn(tmp_path: Path) -> None:
+    """S-R02 correction: a carrier that still holds a human ask is a turn, not a summary.
+
+    Skipping every _compressed_summary row would hide that ask and keep the old hop.
+    The host marks such a row with _compressed_summary_has_user_turn.
+    """
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-parent", "local", "m", None, 1.0, 2.0, "compression", 1, "Parent", 0, "", 2.0),
+        ("local-child", "local", "m", "local-parent", 3.0, None, None, 1, "Child", 0,
+         "agent:main:local:dm:local-child", 4.0),
+        ("local-target-0001", "local", "m", None, 1.0, None, None, 1, "Target", 0,
+         "agent:main:local:dm:local-target-0001", 8.0),
+    ])
+    plugin = _load_plugin()
+    _message(home, "local-parent", _card(plugin, 3), 0)
+    _message(home, "local-child", "please do this new thing", 1, has_user_turn=1)
+    assert plugin.store.latest_user_message_tag(home, "local-child") == (0, 0)
+    sent = _send(
+        RecordingContext(home), target="local-target-0001", message="onward",
+        request_id="op-carrier", caller="local-child",
+    )
+    assert sent["ok"] is True and sent["hop"] == 1
+
+
+
+def test_r4_shorter_window_does_not_erase_same_target_history(tmp_path: Path, monkeypatch) -> None:
+    """R4-D02: a short-window send must not delete history a longer window still owns.
+
+    A body sent under a 3600s guard, then a different body at +700s under a 600s guard,
+    must still be a duplicate when the 3600s guard is restored one second later.
+    """
+    _home_unused, ctx = _routed_pair(tmp_path)
+    plugin = _load_plugin()
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(plugin.delivery.time, "monotonic", lambda: clock["now"])
+
+    def _at(now: float, **kwargs) -> dict:
+        clock["now"] = now
+        return _send(ctx, **kwargs)
+
+    ctx._settings.update(burst_window_seconds=3600, dedup_window_seconds=3600)
+    first = _at(1000.0, target="local-target-0001", message="first", request_id="history-1")
+    ctx._settings.update(burst_window_seconds=600, dedup_window_seconds=120)
+    second = _at(1700.0, target="local-target-0001", message="second", request_id="history-2")
+    ctx._settings.update(burst_window_seconds=3600, dedup_window_seconds=3600)
+    third = _at(1701.0, target="local-target-0001", message="first", request_id="history-3")
+    assert first["ok"] is True and second["ok"] is True
+    assert third["ok"] is False and third["error"] == "duplicate_message"
+    assert len(ctx.injected) == 2
+
+
+def test_r4_retry_keeps_the_first_envelope_after_a_rename(tmp_path: Path, monkeypatch) -> None:
+    """R4-D03: a retry of one request_id resubmits the bytes of the first attempt.
+
+    The host fingerprints the whole card. Rebuilding it after the sender is renamed makes
+    the same request_id look like a different operation.
+    """
+    _home_unused, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    payloads: list[str] = []
+
+    def _ws(*args, **kwargs):
+        payloads.append(args[2])
+        if len(payloads) == 1:
+            return False, "TimeoutError"
+        return True, "adm-env"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    first = _send(
+        ctx, target="local-target-0001", message="same body",
+        sender_label="Before", request_id="label-1",
+    )
+    second = _send(
+        ctx, target="local-target-0001", message="same body",
+        sender_label="After", request_id="label-1",
+    )
+    assert first["ok"] is False and first["error"] == "delivery_unknown"
+    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
+    assert payloads[0] == payloads[1]
+    assert "Before" in payloads[0] and "After" not in payloads[1]
+
+
+def test_r4_card_header_and_custom_reference_are_neutralized(tmp_path: Path) -> None:
+    """R4-D04: the host parses the whole card, not just the message body.
+
+    A sender label of @file:`secrets.env` and a body token @issue:123 both match the
+    installed reference grammar. Neutralizing only the body leaves the header live.
+    """
+    import re
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-target-0001", "local", "m", None, 1.0, None, None, 1, "Target", 0,
+         "agent:main:local:dm:local-target-0001", 8.0),
+    ])
+    ctx = RecordingContext(home)
+    result = _send(
+        ctx, target="local-target-0001", message="see @issue:123",
+        sender_label="@file:`secrets.env`", request_id="op-ref",
+    )
+    assert result["ok"] is True and len(ctx.injected) == 1
+    card = ctx.injected[0]["content"]
+    grammar = re.compile(
+        r"(?<![\w/])@(?:(?:diff|staged)\b|(?:file|folder|git|url):(?:`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|\S+))"
+        r"|(?<![\w/])@[a-zA-Z][a-zA-Z0-9_-]*:(?:`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|\S+)"
+    )
+    assert grammar.search(card) is None
+    assert "secrets.env" in card and "123" in card
+
+
+def test_r4_recent_sends_has_a_bucket_cap(tmp_path: Path, monkeypatch) -> None:
+    """R4-D06: one distinct target per send must not grow the map without a ceiling.
+
+    The cap is small on purpose. A process that talks to more targets than it can remember
+    drops the oldest buckets instead of keeping every one.
+    """
+    home = _home(tmp_path)
+    rows = [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+    ]
+    for n in range(4):
+        sid = f"local-cap-{n:04d}"
+        rows.append((sid, "local", "m", None, 1.0, None, None, 1, f"Cap {n}", 0,
+                     f"agent:main:local:dm:{sid}", 8.0))
+    _insert(home, rows)
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_RECENT_SENDS_MAX_BUCKETS", 2)
+    plugin.delivery._RECENT_SENDS.clear()
+    ctx = RecordingContext(home)
+    for n in range(4):
+        sent = _send(ctx, target=f"local-cap-{n:04d}", message=f"body {n}", request_id=f"cap-{n}")
+        assert sent["ok"] is True
+    assert len(plugin.delivery._RECENT_SENDS) <= 2
+
+
+def test_r4_compression_ancestors_do_not_hide_an_older_live_session(tmp_path: Path) -> None:
+    """S-R05: compressed rows must not eat the discovery window.
+
+    501 recently active compression ancestors and one older live session. The live one
+    is still listed.
+    """
+    home = _home(tmp_path)
+    rows = []
+    for n in range(501):
+        sid = f"local-anc-{n:04d}"
+        rows.append((sid, "local", "m", None, 1.0, 2.0, "compression", 1, f"Anc {n}", 0, "", 1000.0 + n))
+    rows.append((
+        "local-live-older", "local", "m", None, 1.0, None, None, 1, "Older live", 0,
+        "agent:main:local:dm:local-live-older", 10.0,
+    ))
+    _insert(home, rows)
+    found = _load_plugin().store.query_sessions(home)
+    assert any(item["session_id"] == "local-live-older" for item in found)
+
+
+def test_r4_send_to_the_callers_own_reset_predecessor_is_refused(tmp_path: Path, monkeypatch) -> None:
+    """S-R04: the caller's ended predecessor is not an external target.
+
+    No environment key is available and both rows share one route. S-R01 already refuses the
+    stale reset id, so nothing is injected. A different conversation still goes through.
+    """
+    home = _home(tmp_path)
+    shared = "agent:main:local:dm:local-caller"
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, shared, 2.0),
+        ("local-caller", "local", "m", "local-old", 3.0, None, None, 1, "Caller", 0, shared, 9.0),
+        ("local-other-0001", "local", "m", None, 1.0, None, None, 1, "Other", 0,
+         "agent:main:local:dm:local-other-0001", 8.0),
+    ])
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.store, "calling_session_key", lambda: "")
+    ctx = RecordingContext(home)
+    self_send = _send(ctx, target="local-old", message="back to me", caller="local-caller", request_id="self-1")
+    assert self_send["ok"] is False and self_send["error"] == "target_not_found"
+    assert ctx.injected == []
+    other = _send(ctx, target="local-other-0001", message="outward", caller="local-caller", request_id="self-2")
+    assert other["ok"] is True and len(ctx.injected) == 1
+
+
+def test_r4_reset_prefix_resolves_to_the_live_child(tmp_path: Path) -> None:
+    """S-R03: the ended reset row and the live child that keeps its route are one conversation.
+
+    The prefix matches the ended row's own id and the child's route key. The live child wins.
+    Two live rows that really share the prefix stay ambiguous.
+    """
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-rootabcdef"
+    _insert(home, [
+        ("local-rootabcdef", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("local-child-9999", "local", "m", "local-rootabcdef", 3.0, None, None, 1, "Live", 0, key, 5.0),
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(
+        home, "local-rootabc", caller_session_id="local-caller-0001"
+    )
+    assert ambiguous == []
+    assert resolved is not None and resolved["session_id"] == "local-child-9999"
+    _insert(home, [
+        ("local-rootabcxyz", "local", "m", None, 1.0, None, None, 1, "Second", 0,
+         "agent:main:local:dm:local-rootabcxyz", 6.0),
+    ])
+    _again, two = plugin.store.resolve_target(home, "local-rootabc", caller_session_id="local-caller-0001")
+    assert {item["session_id"] for item in two} == {"local-child-9999", "local-rootabcxyz"}
+
+
+def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> None:
+    """R4-STATIC: a terminal receipt is not just a status string.
+
+    completed, cancelled, rejected, failed and interrupted stay distinguishable, and the
+    receipt reference survives next to the admission id.
+    """
+    home, ctx = _routed_pair(tmp_path)
+    ctx.allow_gateway_injection = True
+    ctx._allow_inject = False
+    plugin = _load_plugin()
+
+    def _ws(*_args, **_kwargs):
+        plugin.delivery._RECEIPT_STATUS["receipt-1"] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME["receipt-1"] = "cancelled"
+        plugin.delivery._RECEIPT_REFERENCE["receipt-1"] = "ref-9"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    result = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-1")
+    assert result["ok"] is True
+    assert result["outcome"] == "cancelled"
+    assert result["reference"] == "ref-9"
+
+
+def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_path: Path, monkeypatch) -> None:
+    """R4-D05: a metadata key is unverified when the routing index names other sessions and not this one.
+
+    An empty gateway_routing table keeps the old path. The suite's local sessions have one and
+    it is empty. A table that names a different session makes this target mount first.
+    """
+    plugin = _load_plugin()
+    mounts: list[str] = []
+    monkeypatch.setattr(
+        plugin.delivery, "mount_dormant_local_session",
+        lambda *_a, **_k: mounts.append("mount") or (True, "mounted"),
+    )
+
+    home, ctx = _routed_pair(tmp_path)
+    ctx.allow_gateway_injection = True
+    bare = _send(ctx, target="local-target-0001", message="hello", request_id="bare-1")
+    assert mounts == [] and bare["ok"] is True
+
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:someone-else", '{"session_id": "local-other"}'),
+    )
+    con.commit()
+    con.close()
+    indexed = _send(ctx, target="local-target-0001", message="again", request_id="indexed-1")
+    assert mounts == ["mount"] and indexed["ok"] is True
+
+
+
+
+
+
+
+
+
+
+
 
 

@@ -383,6 +383,11 @@ def query_sessions(
             where_parts.append("lower(id) NOT LIKE 'cron\\_%' ESCAPE '\\'")
         if "title" in colset:
             where_parts.append("COALESCE(title, '') NOT LIKE 'Subagent:%'")
+        if "end_reason" in colset:
+            # S-R05: a profile full of compression ancestors used to fill the window, so the
+            # older live session was read and then discarded. Exclude them before the LIMIT.
+            quoted = ", ".join(f"'{reason}'" for reason in sorted(_COMPRESSED_END_REASONS))
+            where_parts.append(f"lower(COALESCE(end_reason, '')) NOT IN ({quoted})")
         if not include_archived:
             if "archived" in colset:
                 where_parts.append("COALESCE(archived, 0) = 0")
@@ -688,6 +693,7 @@ def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key)
         "_archived": _safe_int(_row_get(r, "archived"), 0) != 0 or _safe_int(_row_get(r, "hidden"), 0) != 0,
         "_cron": row_source.strip().lower() == "cron" or sid.startswith("cron_"),
         "_active": ended_at is None or ended_at == "",
+        "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
     }
 
 
@@ -858,6 +864,11 @@ def resolve_target(
     if direct is not None and needle_low in (
         direct["session_id"].lower(), direct["root_session_id"].lower(), direct["session_key"].lower()
     ):
+        # A row ended by session_reset keeps the key the live conversation now owns. Returning it
+        # makes the host dispatcher deliver into that new conversation while this result names the
+        # old id (S-R01). The ended id is not a target.
+        if str(direct.get("_end_reason") or "").strip().lower() == "session_reset":
+            return None, []
         return direct, []
 
     # Rank over a much wider window than the public session_list cap so the compression
@@ -910,9 +921,22 @@ def resolve_target(
         if len(prefix_hits) == 1:
             return prefix_hits[0], []
         narrowed = [s for s in prefix_hits if not s.get("_archived") and not s.get("_cron")]
-        if len(narrowed) == 1:
-            return narrowed[0], []
-        return None, (narrowed or prefix_hits)[:8]
+        # S-R03: an ended reset row and the live child that keeps its route are one conversation.
+        # Two live rows that share a prefix stay ambiguous.
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for item in narrowed:
+            by_key.setdefault(item.get("session_key") or item["session_id"], []).append(item)
+        collapsed = []
+        for group in by_key.values():
+            live = [item for item in group if item.get("_active", True)]
+            ended = [item for item in group if not item.get("_active", True)]
+            if len(live) == 1 and ended:
+                collapsed.append(live[0])
+            else:
+                collapsed.extend(group)
+        if len(collapsed) == 1:
+            return collapsed[0], []
+        return None, (collapsed or prefix_hits)[:8]
 
     # Tier 3 - title: exact title first, then substring, active before archived, never cron.
     non_cron = [s for s in title_hits if not s.get("_cron")]
@@ -1077,6 +1101,14 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
                 break
             seen.add(current)
             where = "session_id = ?" + (" AND role = 'user'" if has_role else "")
+            # A pure compression summary is not a turn, so it must not hide the parent's card
+            # (S-R02). A carrier that still holds a real user ask is a turn: the host marks it
+            # with _compressed_summary_has_user_turn. Skipping every flagged row would drop that ask.
+            if "_compressed_summary" in msg_cols and "_compressed_summary_has_user_turn" in msg_cols:
+                where += (
+                    " AND (COALESCE(_compressed_summary, 0) = 0"
+                    " OR COALESCE(_compressed_summary_has_user_turn, 0) != 0)"
+                )
             row = con.execute(
                 f"SELECT content FROM messages WHERE {where} ORDER BY {order_col} DESC LIMIT 1",
                 (current,),
@@ -1115,17 +1147,21 @@ def sanitize_card_sender(raw_label: str) -> str:
     return cleaned
 
 
-# Directives the host expands inside the receiving session's workspace
-# (gateway/session_context_refs.py). A delivered body must not carry them.
+# The host expands these anywhere in the card, including the sender label
+# (agent/context_references.py). Built-ins are file/folder/git/url/diff/staged.
+# A registered provider is any @word:value the built-in pattern did not claim.
 _DIRECTIVE_RE = re.compile(
-    r"@+(file|folder|diff|git|url):|@+(diff|staged)\b",
+    r"@+(file|folder|diff|git|url):|@+(diff|staged)\b|@+([a-zA-Z][a-zA-Z0-9_-]*):",
     re.IGNORECASE,
 )
 
 
 def neutralize_directives(text: str) -> str:
-    """Break ``@file:`` and its siblings so the target session cannot expand them."""
-    return _DIRECTIVE_RE.sub(lambda m: (m.group(1) or m.group(2) or "ref") + ":", text)
+    """Break ``@file:`` and registered ``@kind:`` so the target session cannot expand them.
+
+    The readable value stays. Only the ``@`` that makes it a directive is removed.
+    """
+    return _DIRECTIVE_RE.sub(lambda m: (m.group(1) or m.group(2) or m.group(3) or "ref") + ":", text)
 
 
 def format_intercom_message(
@@ -1137,7 +1173,7 @@ def format_intercom_message(
     expect_reply: bool,
     message: str,
 ) -> str:
-    card_name = sanitize_card_sender(sender_card_name)
+    card_name = neutralize_directives(sanitize_card_sender(sender_card_name))
     safe_sid = re.sub(
         r"[\s\[\]]+", "", sanitize_utf8_text(str(sender_session_id or "unknown"))
     ) or "unknown"

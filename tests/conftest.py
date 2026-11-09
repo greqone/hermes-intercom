@@ -50,6 +50,8 @@ def _clear_delivery_state() -> None:
         delivery._OPERATIONS.clear()
         delivery._BUCKET_HORIZON.clear()
         delivery._RECEIPT_STATUS.clear()
+        delivery._RECEIPT_OUTCOME.clear()
+        delivery._RECEIPT_REFERENCE.clear()
 
 
 @pytest.fixture(autouse=True)

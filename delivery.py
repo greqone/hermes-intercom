@@ -35,6 +35,10 @@ _MESSAGE_MAX_CHARS = 32 * 1024
 _OPERATIONS: dict[str, dict[str, Any]] = {}
 _OPERATION_MAX = 4096
 
+# One bucket per target. A long-lived process that talks to a new target every time must not
+# keep them all (R4-D06). The oldest buckets go first.
+_RECENT_SENDS_MAX_BUCKETS = 4096
+
 # Bounds for the inbound-hop memory so long-running Gateway processes never leak (W213a).
 _TURN_HOP_MAX = 1024
 _TURN_HOP_TTL = 3600.0
@@ -49,6 +53,10 @@ _DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="herm
 _BUCKET_HORIZON: dict[tuple[str, str], float] = {}
 # Gateway receipt status keyed by request_id. The submit tuple stays (ok, admission_id).
 _RECEIPT_STATUS: dict[str, str] = {}
+# status says where the receipt is. outcome says how it ended. reference is the host's id for it.
+# Keeping only status makes completed and cancelled look the same (R4-STATIC).
+_RECEIPT_OUTCOME: dict[str, str] = {}
+_RECEIPT_REFERENCE: dict[str, str] = {}
 
 
 def shutdown_discovery_executor() -> None:
@@ -477,6 +485,12 @@ def submit_via_gateway_ws(
                             status = str(receipt.get("status") or "admitted")
                             if request_id and status:
                                 _RECEIPT_STATUS[request_id] = status
+                            outcome = str(receipt.get("outcome") or "")
+                            reference = str(receipt.get("ref") or receipt.get("reference") or "")
+                            if request_id and outcome:
+                                _RECEIPT_OUTCOME[request_id] = outcome
+                            if request_id and reference:
+                                _RECEIPT_REFERENCE[request_id] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -714,9 +728,15 @@ def _evict_stale_send_buckets(now_mono: float) -> None:
 
 def _recent_sends_for(
     bucket_key: tuple[str, str], now_mono: float, keep_win: float
-) -> list[tuple[float, str, str, str]]:
-    """Fresh history for one bucket, normalized to 4-tuples (caller holds ``_LOCK``)."""
-    history: list[tuple[float, str, str, str]] = []
+) -> tuple[list[tuple[float, str, str, str]], list[tuple[float, str, str, str]]]:
+    """``(visible, retained)`` for one bucket (caller holds ``_LOCK``).
+
+    ``visible`` is what this call's window may judge. ``retained`` keeps every entry still
+    inside the bucket's own horizon, so a shorter window cannot erase it (R4-D02).
+    """
+    horizon = max(float(keep_win), _BUCKET_HORIZON.get(bucket_key, _SEND_BUCKET_MIN_HORIZON))
+    visible: list[tuple[float, str, str, str]] = []
+    retained: list[tuple[float, str, str, str]] = []
     for entry in _RECENT_SENDS.get(bucket_key, []):
         try:
             ts = float(entry[0])
@@ -725,9 +745,14 @@ def _recent_sends_for(
         except (TypeError, ValueError, IndexError):
             continue
         token = str(entry[3]) if len(entry) > 3 else ""
-        if (now_mono - ts) < keep_win:
-            history.append((ts, sender, digest, token))
-    return history
+        age = now_mono - ts
+        if age >= horizon:
+            continue
+        row = (ts, sender, digest, token)
+        retained.append(row)
+        if age < keep_win:
+            visible.append(row)
+    return visible, retained
 
 
 def _classic_cli_host(ctx: Any) -> bool:
@@ -949,12 +974,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             })
         if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
             return _json({**prior["result"], "replayed": True})
-        # A finished gateway send is not an open claim. The retry must not take the inject path:
-        # the first submit already resumed the target, so inject would land a second copy (R3-01).
-        # It goes back to the gateway, which dedups on this request_id.
-        ws_retry = (
-            prior is not None and prior.get("delivered") and prior.get("delivery_method") == "gateway_ws"
-        )
+        # A gateway attempt stays a gateway attempt. That covers a confirmed submit and one
+        # whose receipt was lost (delivery_unknown). The retry goes back to the gateway, which
+        # dedups on this request_id. Taking inject_message would land a second copy when the
+        # first submit had already reached the peer (R3-01, R4-D01).
+        ws_retry = prior is not None and prior.get("delivery_method") == "gateway_ws"
         # An unfinished claim blocks only while this call is still inside the function. A returned
         # delivery_unknown drops the claim, so this branch is the overlapping caller (R3-02).
         if prior is not None and not prior.get("delivered") and not ws_retry:
@@ -964,13 +988,13 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 "request_id": send_token,
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
-        if prior is None and not ws_retry:
+        if prior is None:
             # Claimed before delivery so a second caller with the same id waits on this one
-            # instead of delivering beside it. A gateway retry keeps the finished record.
+            # instead of delivering beside it. A gateway retry keeps the record it already has.
             _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
         _remember_bucket_horizon(bucket_key, keep_win)
         _evict_stale_send_buckets(now_mono)
-        history = _recent_sends_for(bucket_key, now_mono, keep_win)
+        history, retained = _recent_sends_for(bucket_key, now_mono, keep_win)
         if dedup_win > 0 and any(
             sender == caller_sid and d == digest and (now_mono - ts) < dedup_win and tok != send_token
             for ts, sender, d, tok in history
@@ -999,9 +1023,14 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     "message": f"Rate limit reached: {max_per_win} messages to {resolved['session_id']} within {burst_win}s.",
                 }
             )
-        if not any(tok == send_token for _ts, _sender, _d, tok in history):
-            history.append((now_mono, caller_sid, digest, send_token))
-        _RECENT_SENDS[bucket_key] = history
+        if not any(tok == send_token for _ts, _sender, _d, tok in retained):
+            retained.append((now_mono, caller_sid, digest, send_token))
+        _RECENT_SENDS[bucket_key] = retained
+        while len(_RECENT_SENDS) > _RECENT_SENDS_MAX_BUCKETS:
+            oldest = min(
+                _RECENT_SENDS, key=lambda key: _RECENT_SENDS[key][-1][0] if _RECENT_SENDS[key] else 0.0
+            )
+            _RECENT_SENDS.pop(oldest, None)
 
     sender_info = store.lookup_sender_info(home, caller_sid, ns=ns, caller_session_key=caller_key)
     real_short = sender_info["short_id"]
@@ -1024,6 +1053,12 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         expect_reply=expect_reply,
         message=message_body,
     )
+    # A retry resubmits the first attempt's bytes. Rebuilding the card after a rename or a
+    # retitle makes the same request_id look like a different operation to the host (R4-D03).
+    with _LOCK:
+        frozen = _OPERATIONS.get(send_token) or {}
+        if frozen.get("delivery_method") == "gateway_ws" and frozen.get("envelope"):
+            payload = frozen["envelope"]
 
     # One overall budget shared by mount + WS submit so a dormant wake cannot double the wait (W212d).
     overall_deadline = time.monotonic() + float(cfg["mount_timeout_seconds"])
@@ -1036,6 +1071,22 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     dormant_local = ":local:dm:" in target_key
     routed = resolved.get("routed", True)
     routed = True if routed is None else bool(routed)
+    # R4-D05: a session_key column is metadata. It is unverified only when gateway_routing
+    # exists and does not name this session. No routing table at all keeps the old path,
+    # because a store without that index cannot prove the key is stale.
+    if routed and dormant_local:
+        db_path = Path(home) / "state.db"
+        if db_path.is_file():
+            con = store._connect_ro(db_path)
+            try:
+                has_index = bool(store._column_names(con, "gateway_routing"))
+                sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
+            finally:
+                con.close()
+            if has_index and (sid_to_key or key_to_entry):
+                route_key = resolved.get("session_key") or ""
+                if route_key not in key_to_entry and resolved["session_id"] not in sid_to_key:
+                    routed = False
 
     mounted_dormant = False
     delivery_method = "inject_message"
@@ -1094,12 +1145,24 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     _RECENT_SENDS[bucket_key] = remaining
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
-                _OPERATIONS.pop(send_token, None)
+                # A confirmed or unconfirmed gateway attempt keeps its transport. A later retry
+                # must go back to the gateway, not through inject_message (R4-D01).
+                kept = _OPERATIONS.get(send_token)
+                if not (kept and kept.get("delivery_method") == "gateway_ws"):
+                    _OPERATIONS.pop(send_token, None)
         else:
-            # The call has returned. Keeping the claim would make the retry the message asks for
-            # come back as request_in_flight for the life of the process (R3-02).
+            # The receipt is gone but the submit may have landed. Remember the transport and
+            # drop the in-flight bit, so the retry the message asks for is not request_in_flight
+            # and does not switch to inject_message (R3-02, R4-D01).
             with _LOCK:
-                _OPERATIONS.pop(send_token, None)
+                prior_op = _OPERATIONS.get(send_token) or {}
+                _OPERATIONS[send_token] = {
+                    "payload_hash": prior_op.get("payload_hash", payload_hash),
+                    "delivered": False,
+                    "delivery_method": "gateway_ws",
+                    "envelope": payload,
+                    "result": {},
+                }
         unknown = in_flight and bool(ws_err)
         result: dict[str, Any] = {
             "ok": False,
@@ -1156,6 +1219,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         "request_id": send_token,
         "admission_id": admission_id,
         "admission_status": _RECEIPT_STATUS.get(send_token, ""),
+        "outcome": _RECEIPT_OUTCOME.get(send_token, ""),
+        "reference": _RECEIPT_REFERENCE.get(send_token, ""),
         "note": (
             "The gateway accepted this prompt into the target session."
             if delivery_method == "gateway_ws" else
@@ -1170,6 +1235,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "payload_hash": payload_hash,
             "delivered": True,
             "delivery_method": delivery_method,
+            "envelope": payload,
             "result": result,
         }
     return _json(result)
