@@ -220,7 +220,7 @@ def test_s02_single_unicode_title_resolves(tmp_path: Path) -> None:
 def test_s03_unc_uri_keeps_the_server_share(tmp_path: Path) -> None:
     plugin = _load_plugin()
     uri = plugin.store._sqlite_uri(Path("//server/share/state.db"))
-    assert uri.startswith("file://///server/share/state.db")
+    assert uri.startswith("file:////server/share/state.db")
 
 
 # --- S04 -------------------------------------------------------------------
@@ -377,3 +377,163 @@ def test_c01_public_text_makes_no_durability_overclaim() -> None:
     assert "exactly-once guarantee" not in blob.replace("not an exactly-once guarantee", "")
     assert "own identical budget" not in (root / "plugin.yaml").read_text(encoding="utf-8")
     assert "highest hop" not in (root / "skills/hermes-intercom/SKILL.md").read_text(encoding="utf-8")
+
+
+# --- Round 2 ---------------------------------------------------------------
+
+def test_r2_include_cron_returns_cron_sessions(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-real", "local", "m", None, 1.0, None, None, 1, "Real", 0,
+         "agent:main:local:dm:local-real", 5.0),
+        ("cron_daily", "cron", "m", None, 1.0, None, None, 1, "Daily", 0, None, 9.0),
+    ])
+    plugin = _load_plugin()
+    hidden = plugin.store.query_sessions(home, limit=20)
+    shown = plugin.store.query_sessions(home, limit=20, include_cron=True)
+    assert [row["session_id"] for row in hidden] == ["local-real"]
+    assert "cron_daily" in {row["session_id"] for row in shown}
+
+
+def test_r2_branch_descendant_does_not_inherit_the_reply(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    rows = [
+        ("local-ancestor", "local", "m", None, 1.0, 2.0, "compression", 3, "Old", 0, None, 2.0),
+        ("local-continuation", "local", "m", "local-ancestor", 3.0, None, None, 2, "Live", 0,
+         "agent:main:local:dm:local-continuation", 10.0),
+        ("local-branch", "local", "m", "local-ancestor", 4.0, 5.0, "compression", 1, "Branch", 0,
+         None, 20.0),
+        ("local-branch-child", "local", "m", "local-branch", 6.0, None, None, 1, "Child", 0,
+         "agent:main:local:dm:local-branch-child", 30.0),
+    ]
+    _insert(home, rows)
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE sessions ADD COLUMN model_config TEXT")
+    con.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = 'local-branch'",
+        (json.dumps({"_branched_from": "local-ancestor"}),),
+    )
+    con.commit()
+    con.close()
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-ancestor")
+    assert ambiguous == []
+    assert resolved is not None and resolved["session_id"] == "local-continuation"
+
+
+def test_r2_doubled_at_and_bare_diff_are_neutralized() -> None:
+    plugin = _load_plugin()
+    rendered = plugin.store.format_intercom_message(
+        sender_card_name="A", sender_session_id="local-a", hop=1, max_hops=3,
+        expect_reply=False, message="see @@file:secrets.env and @diff",
+    )
+    body = rendered.rsplit("\n\n", 1)[-1]
+    assert "@file:" not in body and "@diff" not in body
+
+
+def test_r2_title_that_looks_like_an_id_still_resolves(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [("local-actual", "local", "m", None, 1.0, None, None, 1, "local-topic", 0,
+                    "agent:main:local:dm:local-actual", 5.0)])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-topic")
+    assert ambiguous == []
+    assert resolved is not None and resolved["session_id"] == "local-actual"
+
+
+def test_r2_same_request_id_on_another_target_conflicts(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-target-0001", "local", "m", None, 1.0, None, None, 1, "One", 0,
+         "agent:main:local:dm:local-target-0001", 8.0),
+        ("local-target-0002", "local", "m", None, 1.0, None, None, 1, "Two", 0,
+         "agent:main:local:dm:local-target-0002", 7.0),
+    ])
+    ctx = RecordingContext(home)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-1")
+    second = _send(ctx, target="local-target-0002", message="hello", request_id="op-1")
+    assert first["ok"] is True
+    assert second["ok"] is False and second["error"] == "request_conflict"
+    assert len(ctx.injected) == 1
+
+
+def test_r2_long_sender_label_keeps_the_real_id(tmp_path: Path) -> None:
+    _unused, ctx = _routed_pair(tmp_path)
+    _send(ctx, target="local-target-0001", message="hi", sender_label="Boss " + "X" * 80)
+    head = ctx.injected[0]["content"].split("]", 1)[0]
+    assert "local-caller-0" in head
+
+
+def test_f05_mount_requires_the_gateway_grant(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path)
+    _insert(home, [("local-unrouted-01", "local", "m", None, 1.0, None, None, 1, "Loose", 0, None, 5.0)])
+    ctx = RecordingContext(home)
+    ctx.allow_gateway_injection = False
+    plugin = _load_plugin()
+    called: list[str] = []
+    monkeypatch.setattr(
+        plugin.delivery, "mount_dormant_local_session",
+        lambda *a, **k: called.append("mount") or (True, "mounted"),
+    )
+    result = _send(ctx, target="local-unrouted-01", message="ping")
+    assert called == []
+    assert result["ok"] is False
+    assert ctx.injected == []
+
+
+def test_f19_terminal_receipt_is_not_reported_as_admitted(tmp_path: Path, monkeypatch) -> None:
+    home, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _terminal(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        return True, "adm-9"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _terminal)
+    result = _send(ctx, target="local-target-0001", message="hello", request_id="op-term")
+    assert result["ok"] is True
+    assert result["status"] == "terminal"
+    assert result["admission_status"] == "terminal"
+
+
+def test_f20_register_shuts_the_discovery_pool_on_unload(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    plugin = _load_plugin()
+    seen: list[object] = []
+
+    class Host(RecordingContext):
+        def on_unload(self, callback) -> None:
+            seen.append(callback)
+
+    plugin.register(Host(home))
+    assert seen == [plugin.delivery.shutdown_discovery_executor]
+
+
+def test_f21_audit_log_is_documented() -> None:
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert "audit.jsonl" in readme
+    assert "2 MiB" in readme
+
+
+def test_f14_manager_home_beats_the_ambient_env(tmp_path: Path, monkeypatch) -> None:
+    """PluginContext has no home_path. The profile lives on ctx._manager.home_path."""
+    profile = tmp_path / "profile-home"
+    ambient = tmp_path / "ambient-home"
+    profile.mkdir()
+    ambient.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    plugin = _load_plugin()
+
+    class Manager:
+        home_path = profile
+
+    class Host:
+        _manager = Manager()
+
+    assert plugin.store.resolve_home(Host()) == profile.resolve()
+

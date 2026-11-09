@@ -365,7 +365,7 @@ def test_classic_cli_send_does_not_land_in_the_senders_repl(
             {"target": sid_b, "message": "for B only, second"}, session_id=sid_a
         )
     )
-    assert refused["ok"] is False and refused["error"] == "injection_refused"
+    assert refused["ok"] is False and refused["error"] == "surface_cannot_route"
     assert host.local_queue == []
 
     control = RecordingContext(home)
@@ -539,6 +539,7 @@ def test_dormant_local_session_auto_mounts_then_injects(
             return super().inject_message(content, role, session_key=session_key, origin=origin)
 
     ctx = DormantUntilMountedContext(home)
+    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
     hermes_intercom.register(ctx)
 
     def fake_mount(home_dir: Path, target_sid: str, *, timeout: float = 8.0) -> tuple[bool, str]:
@@ -1190,6 +1191,7 @@ def test_unrouted_local_dm_target_mounts_before_inject_message(
             return super().inject_message(content, role, session_key=session_key, origin=origin)
 
     ctx = OrderedContext(home)
+    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
     hermes_intercom.register(ctx)
 
     def fake_mount(home_dir: Path, target_sid: str, *, timeout: float = 8.0) -> tuple[bool, str]:
@@ -1709,8 +1711,9 @@ def test_hop_memory_and_send_buckets_stay_bounded(tmp_path: Path) -> None:
         assert ("h", "stale") not in delivery._TURN_HOP
 
         delivery._RECENT_SENDS[("h", "target")] = [(now - 120.0, "sid", "digest", "token")]
-        delivery._evict_stale_send_buckets(now, 1.0)
-        assert ("h", "target") in delivery._RECENT_SENDS, "a 1s window must not evict 600s history"
+        delivery._BUCKET_HORIZON[("h", "target")] = 600.0
+        delivery._evict_stale_send_buckets(now)
+        assert ("h", "target") in delivery._RECENT_SENDS, "a 1s caller must not evict a 600s bucket"
 
 
 def test_a_second_call_without_request_id_is_not_the_same_operation(

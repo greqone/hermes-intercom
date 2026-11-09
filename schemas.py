@@ -83,8 +83,9 @@ SESSION_SEND_SCHEMA: dict = {
                 "type": "string",
                 "description": (
                     "Optional retry identity, 1-1024 characters. Pass the request_id from an earlier "
-                    "result to retry that same operation: an identical retry returns the first outcome "
+                    "result to retry that same operation: an identical inject retry returns the first outcome "
                     "without delivering again, and a different message under the same id is refused. "
+                    "A gateway submit is deduplicated by the gateway, not replayed here. "
                     "Omit it for a new send. This identifies one operation inside this process; it is "
                     "not an exactly-once guarantee across restarts."
                 ),

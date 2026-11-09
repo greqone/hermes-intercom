@@ -67,12 +67,16 @@ class StoreReadError(RuntimeError):
 def resolve_home(ctx: Any = None) -> Path:
     """Resolve the Hermes home directory for this call.
 
-    Order: explicit ``ctx.home_path`` -> ``hermes_constants.get_hermes_home()`` (which already
-    honors the thread/async ContextVar override *and* ``HERMES_HOME``) -> a stripped and expanded
-    ``HERMES_HOME`` -> ``~/.hermes``.
+    Order: explicit ``ctx.home_path`` -> the host manager's home (``ctx._manager.home_path``,
+    which is where ``PluginContext`` actually keeps the profile) -> ``hermes_constants.get_hermes_home()``
+    (which already honors the thread/async ContextVar override *and* ``HERMES_HOME``) -> a stripped and
+    expanded ``HERMES_HOME`` -> ``~/.hermes``.
     """
     if ctx is not None:
         home = getattr(ctx, "home_path", None)
+        if home is None:
+            manager = getattr(ctx, "_manager", None)
+            home = getattr(manager, "home_path", None)
         if home is not None:
             text = str(home).strip()
             if text:
@@ -196,27 +200,25 @@ def _sqlite_uri(db_path: Path) -> str:
 
     Encoding keeps ``#``, ``%`` and ``?`` inside directory names from breaking the URI.
 
-    A UNC path needs five slashes (``file://///server/share/db``). SQLite rejects any non-empty
-    authority, and the previous four-slash form parsed ``server`` as that authority.
+    A UNC path keeps its leading slashes (``resolve()`` would drop them on POSIX) and uses the
+    four-slash form SQLite opens on Windows. The five-slash form fails against a real share.
     """
     raw_posix = db_path.as_posix()
     is_unc = raw_posix.startswith("//") or str(db_path).startswith("\\\\")
     if is_unc:
-        # ``resolve()`` on POSIX collapses ``//server/share`` to ``/server/share``, which is a
-        # different path. A UNC target is encoded as given.
+        # ``resolve()`` on POSIX collapses ``//server/share`` to ``/server/share``. Keep the UNC form,
+        # and keep the four slashes: on Windows SQLite the five-slash form fails to open a real
+        # ``\\localhost\c$`` share while four slashes opens it (measured 2026-11-09).
         posix = raw_posix if raw_posix.startswith("//") else "//" + str(db_path).lstrip("\\").replace("\\", "/")
+        # ``file:`` plus ``////server`` is the four-slash form. ``as_posix()`` only keeps two, and
+        # ``file://server`` does not open a Windows share.
+        encoded = urllib.parse.quote("//" + posix, safe="/:")
     else:
         try:
             resolved = db_path.resolve()
         except OSError:
             resolved = db_path
         posix = resolved.as_posix()
-    if posix.startswith("//"):
-        # ``file:`` + ``///`` + the encoded ``//server/share`` gives the five slashes SQLite
-        # needs for an empty authority and a UNC path. Four slashes parses ``server`` as the
-        # authority and the open fails.
-        encoded = "///" + urllib.parse.quote(posix, safe="/:")
-    else:
         encoded = urllib.parse.quote(posix, safe="/:")
     return f"file:{encoded}?mode=ro"
 
@@ -375,8 +377,10 @@ def query_sessions(
         # profile returned an empty list. Exclude them in SQL; the Python pass stays as a backstop.
         where_parts: list[str] = []
         if "source" in colset:
-            where_parts.append("lower(COALESCE(source, '')) NOT IN ('subagent', 'cron')")
-        where_parts.append("lower(id) NOT LIKE 'cron\\_%' ESCAPE '\\'")
+            excluded = "'subagent'" if include_cron else "'subagent', 'cron'"
+            where_parts.append(f"lower(COALESCE(source, '')) NOT IN ({excluded})")
+        if not include_cron:
+            where_parts.append("lower(id) NOT LIKE 'cron\\_%' ESCAPE '\\'")
         if "title" in colset:
             where_parts.append("COALESCE(title, '') NOT LIKE 'Subagent:%'")
         if not include_archived:
@@ -596,8 +600,10 @@ def _ancestor_descendants(
                 cid = str(_row_get(child, "id") or "")
                 if not cid or cid.lower() in chain:
                     continue
-                if _is_branch_edge(_row_get(child, "model_config"), ancestor_id):
+                parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
+                if _is_branch_edge(_row_get(child, "model_config"), parent_id):
                     branched.add(cid.lower())
+                    continue
                 chain.append(cid.lower())
                 next_frontier.append(cid)
             frontier = next_frontier
@@ -784,9 +790,12 @@ def _scan_title_and_prefix(
                 params.append("%:local:dm:" + escaped + "%")
         if "title" in colset:
             # No SQL predicate: SQLite lower() does not casefold Ż or ß, so the filter used to drop
-            # the uppercase title before Python ever ranked it (S02). The table is bounded by the
-            # prefix predicate when there is one; a title-only scan reads the rows and folds here.
+            # the uppercase title before Python ever ranked it (S02). A prefix predicate is worse:
+            # a title such as ``local-topic`` never matches ``lower(id) LIKE 'local-topic%'``, so
+            # the row was discarded before the title fold ran. Title matching reads the rows.
             title_scan = True
+            clauses = []
+            params = []
         else:
             title_scan = False
         if not clauses and not title_scan:
@@ -1108,12 +1117,15 @@ def sanitize_card_sender(raw_label: str) -> str:
 
 # Directives the host expands inside the receiving session's workspace
 # (gateway/session_context_refs.py). A delivered body must not carry them.
-_DIRECTIVE_RE = re.compile(r"@(file|folder|diff|git|url):")
+_DIRECTIVE_RE = re.compile(
+    r"@+(file|folder|diff|git|url):|@(diff|staged)\b",
+    re.IGNORECASE,
+)
 
 
 def neutralize_directives(text: str) -> str:
     """Break ``@file:`` and its siblings so the target session cannot expand them."""
-    return _DIRECTIVE_RE.sub(lambda m: m.group(1) + ":", text)
+    return _DIRECTIVE_RE.sub(lambda m: (m.group(1) or m.group(2) or "ref") + ":", text)
 
 
 def format_intercom_message(

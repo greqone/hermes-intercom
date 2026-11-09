@@ -48,6 +48,8 @@ def _clear_delivery_state() -> None:
         delivery._RECENT_SENDS.clear()
         delivery._TURN_HOP.clear()
         delivery._OPERATIONS.clear()
+        delivery._BUCKET_HORIZON.clear()
+        delivery._RECEIPT_STATUS.clear()
 
 
 @pytest.fixture(autouse=True)

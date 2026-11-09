@@ -45,6 +45,23 @@ _SEND_BUCKET_MIN_HORIZON = 600.0
 # Own pool for gateway discovery: ``asyncio.run()`` waits for the *default* executor's
 # ``shutdown_default_executor()``, so a slow ``to_thread`` worker can hang the whole call (W211a).
 _DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hermes-intercom-discover")
+# Per-bucket retention. A caller with a short window must not evict another target's longer one.
+_BUCKET_HORIZON: dict[tuple[str, str], float] = {}
+# Gateway receipt status keyed by request_id. The submit tuple stays (ok, admission_id).
+_RECEIPT_STATUS: dict[str, str] = {}
+
+
+def shutdown_discovery_executor() -> None:
+    """Stop the discovery pool and replace it. The host calls this from ``ctx.on_unload``."""
+    global _DISCOVERY_EXECUTOR
+    try:
+        _DISCOVERY_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        _DISCOVERY_EXECUTOR.shutdown(wait=False)
+    except Exception:
+        logger.debug("hermes-intercom: discovery executor shutdown failed", exc_info=True)
+        return
+    _DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hermes-intercom-discover")
 
 _AUDIT_MAX_BYTES = 2 * 1024 * 1024
 _INTERCOM_TAG_STRIP_RE = re.compile(r"\[intercom[^\]]*\]", re.IGNORECASE)
@@ -456,6 +473,10 @@ def submit_via_gateway_ws(
                         )
                         if isinstance(receipt, dict) and receipt.get("admission_id"):
                             admission_id = str(receipt["admission_id"])
+                            # A terminal or unknown receipt must not read as a fresh admission (F19).
+                            status = str(receipt.get("status") or "admitted")
+                            if request_id and status:
+                                _RECEIPT_STATUS[request_id] = status
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -662,11 +683,18 @@ def tool_session_list(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     )
 
 
-def _evict_stale_send_buckets(now_mono: float, keep_win: float) -> None:
-    """Drop buckets with no entry inside the longest guard window (caller holds ``_LOCK``)."""
+def _remember_bucket_horizon(bucket_key: tuple[str, str], keep_win: float) -> None:
+    """Retain this target for its own window, and never less than the 600s floor (caller holds ``_LOCK``)."""
     horizon = max(float(keep_win), _SEND_BUCKET_MIN_HORIZON)
+    if horizon > _BUCKET_HORIZON.get(bucket_key, 0.0):
+        _BUCKET_HORIZON[bucket_key] = horizon
+
+
+def _evict_stale_send_buckets(now_mono: float) -> None:
+    """Drop a bucket only after its own horizon, not after the caller's (caller holds ``_LOCK``)."""
     stale: list[tuple[str, str]] = []
     for key, entries in _RECENT_SENDS.items():
+        horizon = _BUCKET_HORIZON.get(key, _SEND_BUCKET_MIN_HORIZON)
         fresh = False
         for entry in entries:
             if len(entry) <= 0:
@@ -681,6 +709,7 @@ def _evict_stale_send_buckets(now_mono: float, keep_win: float) -> None:
             stale.append(key)
     for key in stale:
         _RECENT_SENDS.pop(key, None)
+        _BUCKET_HORIZON.pop(key, None)
 
 
 def _recent_sends_for(
@@ -898,7 +927,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
     send_token = supplied_request or uuid.uuid4().hex
-    payload_hash = hashlib.sha256(message_body.encode("utf-8")).hexdigest()
+    identity = "\n".join((
+        str(resolved["session_id"]), target_key, caller_sid, str(bool(expect_reply)), message_body,
+    ))
+    payload_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     wall_now = time.time()
     burst_win = cfg["burst_window_seconds"]
     dedup_win = cfg["dedup_window_seconds"]
@@ -917,12 +949,28 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             })
         if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
             return _json({**prior["result"], "replayed": True})
-        _evict_stale_send_buckets(now_mono, keep_win)
+        # A finished gateway send is not replayed here: the gateway dedups on request_id, and a
+        # retry whose inject path is gone must reach it again. Only an unfinished claim blocks.
+        if prior is not None and not prior.get("delivered"):
+            return _json({
+                "ok": False,
+                "error": "request_in_flight",
+                "request_id": send_token,
+                "message": "This request_id is already being delivered. Retry after it finishes.",
+            })
+        if prior is None:
+            # Claimed before delivery so a second caller with the same id waits on this one
+            # instead of delivering beside it.
+            _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
+        _remember_bucket_horizon(bucket_key, keep_win)
+        _evict_stale_send_buckets(now_mono)
         history = _recent_sends_for(bucket_key, now_mono, keep_win)
         if dedup_win > 0 and any(
             sender == caller_sid and d == digest and (now_mono - ts) < dedup_win and tok != send_token
             for ts, sender, d, tok in history
         ):
+            if prior is None:
+                _OPERATIONS.pop(send_token, None)
             return _json(
                 {
                     "ok": False,
@@ -936,6 +984,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             tok for ts, _sender, _d, tok in history if tok and (now_mono - ts) < burst_win
         }
         if send_token not in seen_tokens and len(seen_tokens) >= max_per_win:
+            if prior is None:
+                _OPERATIONS.pop(send_token, None)
             return _json(
                 {
                     "ok": False,
@@ -950,8 +1000,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     sender_info = store.lookup_sender_info(home, caller_sid, ns=ns, caller_session_key=caller_key)
     real_short = sender_info["short_id"]
     if sender_label_override:
-        card_label = sender_label_override
-        if real_short and real_short not in card_label:
+        room = max(0, 60 - len(f" ({real_short})") - 1) if real_short else 60
+        card_label = sender_label_override[:room].rstrip()
+        if real_short:
             card_label = f"{card_label} ({real_short})"
     elif sender_info["title"]:
         title_short = sender_info["title"][:38].strip()
@@ -982,8 +1033,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     mounted_dormant = False
     delivery_method = "inject_message"
+    # Mount writes the target back into the gateway. That is the same grant as injection (F05).
+    gateway_granted = _is_gateway_injection_allowed(ctx, home)
 
-    if not routed and dormant_local and cfg["auto_mount_dormant"]:
+    if not routed and dormant_local and cfg["auto_mount_dormant"] and gateway_granted:
         # Unrouted :local:dm: keys are a false positive for core: inject_message returns True
         # synchronously and then drops the payload, so mount before injecting (W202).
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
@@ -995,7 +1048,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     injectable = routed or mounted_dormant
     accepted = False if (_classic_cli_host(ctx) or not injectable) else _inject(ctx, payload, target_key)
 
-    if not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"] and dormant_local:
+    if (
+        not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"]
+        and dormant_local and gateway_granted
+    ):
         # Routed but not mounted in authority.sessions right now: core returns False synchronously.
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
         if mounted_ok:
@@ -1004,7 +1060,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     ws_err = ""
     admission_id = ""
-    if not accepted and _is_gateway_injection_allowed(ctx, home) and dormant_local:
+    if not accepted and gateway_granted and dormant_local:
         ws_ok, ws_err = submit_via_gateway_ws(
             home, mount_sid, payload, timeout=_budget(), request_id=send_token
         )
@@ -1029,17 +1085,22 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     _RECENT_SENDS[bucket_key] = remaining
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
+                _OPERATIONS.pop(send_token, None)
         unknown = in_flight and bool(ws_err)
         result: dict[str, Any] = {
             "ok": False,
-            "error": "delivery_unknown" if unknown else "injection_refused",
+            "error": (
+                "surface_cannot_route"
+                if _classic_cli_host(ctx) and not gateway_granted
+                else "delivery_unknown" if unknown else "injection_refused"
+            ),
             "request_id": send_token,
             "target_session_id": resolved["session_id"],
             "target_session_key": target_key,
             "mounted_dormant": mounted_dormant,
             "message": (
-                "The gateway did not confirm this delivery. Retry with the same request_id; "
-                "it will not be delivered twice."
+                "The gateway did not confirm this delivery. Retry with the same request_id. "
+                "A confirmed inject is not sent again; a gateway submit is deduplicated by the gateway."
                 if unknown else
                 "Gateway refused message injection. Ensure "
                 "plugins.entries.hermes-intercom.allow_gateway_injection: true is set in config.yaml "
@@ -1068,7 +1129,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     result = {
         "ok": True,
-        "status": "admitted" if delivery_method == "gateway_ws" else "scheduled",
+        "status": _RECEIPT_STATUS.get(send_token) or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
         "delivery_method": delivery_method,
         "from_session_id": sender_info["session_id"],
         "target_session_id": resolved["session_id"],
@@ -1080,6 +1141,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         "mounted_dormant": mounted_dormant,
         "request_id": send_token,
         "admission_id": admission_id,
+        "admission_status": _RECEIPT_STATUS.get(send_token, ""),
         "note": (
             "The gateway accepted this prompt into the target session."
             if delivery_method == "gateway_ws" else
