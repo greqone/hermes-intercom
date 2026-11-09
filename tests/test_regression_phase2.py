@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -991,6 +993,53 @@ def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> 
     assert result["ok"] is True
     assert result["outcome"] == "cancelled"
     assert result["reference"] == "ref-9"
+
+
+def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatch) -> None:
+    """R4-STATIC: a receipt lives only as long as its operation.
+
+    The maps are filled by the real submit path, through a fake gateway client, not by the
+    test writing them. A later send that pushes the operation cap past this one must take
+    the receipt with it. A retry of the evicted id must not read the old outcome.
+    """
+    home, ctx = _routed_pair(tmp_path)
+    ctx.allow_gateway_injection = True
+    ctx._allow_inject = False
+    plugin = _load_plugin()
+
+    def _ws(*_args, **kwargs):
+        token = kwargs["request_id"]
+        plugin.delivery._RECEIPT_STATUS[token] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[token] = "cancelled"
+        plugin.delivery._RECEIPT_REFERENCE[token] = "ref-9"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 4)
+
+    def _send_here(message: str, request_id: str) -> dict:
+        raw = plugin.delivery.tool_session_send(
+            {"target": "local-target-0001", "message": message, "request_id": request_id},
+            ctx=ctx, session_id="local-caller-0001",
+        )
+        return json.loads(raw)
+
+    first = _send_here("hello", "receipt-old")
+    assert first.get("outcome") == "cancelled", first
+
+    second = _send_here("hello again", "receipt-new")
+    assert second["ok"] is True
+
+    third = _send_here("hello once more", "receipt-third")
+    assert third["ok"] is True
+    assert "receipt-old" in plugin.delivery._RECEIPT_OUTCOME
+
+    fourth = _send_here("and once past the cap", "receipt-fourth")
+    assert fourth["ok"] is True
+    assert "receipt-old" not in plugin.delivery._RECEIPT_STATUS
+    assert "receipt-old" not in plugin.delivery._RECEIPT_OUTCOME
+    assert "receipt-old" not in plugin.delivery._RECEIPT_REFERENCE
+    assert "receipt-fourth" in plugin.delivery._RECEIPT_OUTCOME
 
 
 def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_path: Path, monkeypatch) -> None:

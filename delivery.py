@@ -1231,7 +1231,13 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     }
     with _LOCK:
         if len(_OPERATIONS) >= _OPERATION_MAX:
-            _OPERATIONS.pop(next(iter(_OPERATIONS)), None)
+            evicted = next(iter(_OPERATIONS))
+            _OPERATIONS.pop(evicted, None)
+            # The receipt belongs to the operation. Leaving it lets a later reuse of the same
+            # request_id read the previous outcome (R4-STATIC).
+            _RECEIPT_STATUS.pop(evicted, None)
+            _RECEIPT_OUTCOME.pop(evicted, None)
+            _RECEIPT_REFERENCE.pop(evicted, None)
         _OPERATIONS[send_token] = {
             "payload_hash": payload_hash,
             "delivered": True,
