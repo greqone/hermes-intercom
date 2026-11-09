@@ -860,6 +860,43 @@ def test_r4_recent_sends_has_a_bucket_cap(tmp_path: Path, monkeypatch) -> None:
     assert len(plugin.delivery._RECENT_SENDS) <= 2
 
 
+def test_r4_bucket_eviction_drops_the_horizon_and_receipts_are_capped(tmp_path: Path, monkeypatch) -> None:
+    """R4-D06, the part the bucket cap left open.
+
+    Dropping the oldest send bucket must drop its horizon too, or the horizon map grows
+    for every target the process ever talked to. Receipt maps follow the operation cap,
+    so a finished send does not leave its status behind after the operation is gone.
+    """
+    home = _home(tmp_path)
+    rows = [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+    ]
+    for n in range(4):
+        sid = f"local-side-{n:04d}"
+        rows.append((sid, "local", "m", None, 1.0, None, None, 1, f"Side {n}", 0,
+                     f"agent:main:local:dm:{sid}", 8.0))
+    _insert(home, rows)
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_RECENT_SENDS_MAX_BUCKETS", 2)
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
+    plugin.delivery._RECENT_SENDS.clear()
+    plugin.delivery._BUCKET_HORIZON.clear()
+    plugin.delivery._RECEIPT_STATUS.clear()
+    plugin.delivery._RECEIPT_OUTCOME.clear()
+    plugin.delivery._RECEIPT_REFERENCE.clear()
+    ctx = RecordingContext(home)
+    for n in range(4):
+        sent = _send(ctx, target=f"local-side-{n:04d}", message=f"body {n}", request_id=f"side-{n}")
+        assert sent["ok"] is True
+    assert len(plugin.delivery._RECENT_SENDS) <= 2
+    assert set(plugin.delivery._BUCKET_HORIZON) <= set(plugin.delivery._RECENT_SENDS)
+    assert len(plugin.delivery._OPERATIONS) <= 2
+    assert set(plugin.delivery._RECEIPT_STATUS) <= set(plugin.delivery._OPERATIONS)
+    assert set(plugin.delivery._RECEIPT_OUTCOME) <= set(plugin.delivery._OPERATIONS)
+    assert set(plugin.delivery._RECEIPT_REFERENCE) <= set(plugin.delivery._OPERATIONS)
+
+
 def test_r4_compression_ancestors_do_not_hide_an_older_live_session(tmp_path: Path) -> None:
     """S-R05: compressed rows must not eat the discovery window.
 

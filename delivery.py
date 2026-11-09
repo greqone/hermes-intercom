@@ -1031,6 +1031,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 _RECENT_SENDS, key=lambda key: _RECENT_SENDS[key][-1][0] if _RECENT_SENDS[key] else 0.0
             )
             _RECENT_SENDS.pop(oldest, None)
+            _BUCKET_HORIZON.pop(oldest, None)
 
     sender_info = store.lookup_sender_info(home, caller_sid, ns=ns, caller_session_key=caller_key)
     real_short = sender_info["short_id"]
