@@ -537,3 +537,55 @@ def test_f14_manager_home_beats_the_ambient_env(tmp_path: Path, monkeypatch) -> 
 
     assert plugin.store.resolve_home(Host()) == profile.resolve()
 
+
+def test_r3_gateway_retry_does_not_inject_a_second_copy(tmp_path: Path, monkeypatch) -> None:
+    """R3-01: a finished gateway send, retried once inject works, must not deliver twice."""
+    home, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls: list[str] = []
+
+    def _ws(*_a, **kwargs):
+        calls.append(kwargs.get("request_id", ""))
+        ctx._allow_inject = True
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
+    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
+    assert ctx.injected == []
+    assert calls == ["op-ws", "op-ws"]
+
+
+def test_r3_unknown_delivery_can_be_retried(tmp_path: Path, monkeypatch) -> None:
+    """R3-02: delivery_unknown must not wedge the request_id for the life of the process."""
+    home, ctx = _routed_pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    answers = [(False, "TimeoutError"), (True, "adm-2")]
+
+    def _ws(*_a, **kwargs):
+        return answers.pop(0)
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk")
+    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk")
+    assert first["ok"] is False and first["error"] == "delivery_unknown"
+    assert second["ok"] is True and second.get("error") != "request_in_flight"
+    assert second["delivery_method"] == "gateway_ws"
+
+
+def test_r3_doubled_bare_directives_are_neutralized() -> None:
+    plugin = _load_plugin()
+    rendered = plugin.store.format_intercom_message(
+        sender_card_name="A", sender_session_id="local-a", hop=1, max_hops=3,
+        expect_reply=False, message="see @@diff and @@staged",
+    )
+    body = rendered.rsplit("\n\n", 1)[-1]
+    assert "@diff" not in body and "@staged" not in body
+
+

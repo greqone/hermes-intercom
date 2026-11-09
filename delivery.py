@@ -949,18 +949,24 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             })
         if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
             return _json({**prior["result"], "replayed": True})
-        # A finished gateway send is not replayed here: the gateway dedups on request_id, and a
-        # retry whose inject path is gone must reach it again. Only an unfinished claim blocks.
-        if prior is not None and not prior.get("delivered"):
+        # A finished gateway send is not an open claim. The retry must not take the inject path:
+        # the first submit already resumed the target, so inject would land a second copy (R3-01).
+        # It goes back to the gateway, which dedups on this request_id.
+        ws_retry = (
+            prior is not None and prior.get("delivered") and prior.get("delivery_method") == "gateway_ws"
+        )
+        # An unfinished claim blocks only while this call is still inside the function. A returned
+        # delivery_unknown drops the claim, so this branch is the overlapping caller (R3-02).
+        if prior is not None and not prior.get("delivered") and not ws_retry:
             return _json({
                 "ok": False,
                 "error": "request_in_flight",
                 "request_id": send_token,
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
-        if prior is None:
+        if prior is None and not ws_retry:
             # Claimed before delivery so a second caller with the same id waits on this one
-            # instead of delivering beside it.
+            # instead of delivering beside it. A gateway retry keeps the finished record.
             _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
         _remember_bucket_horizon(bucket_key, keep_win)
         _evict_stale_send_buckets(now_mono)
@@ -1046,7 +1052,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # A synthesized key that did not mount is not a route. Injecting it reports success for a
     # message the gateway drops, so it never happens (D03).
     injectable = routed or mounted_dormant
-    accepted = False if (_classic_cli_host(ctx) or not injectable) else _inject(ctx, payload, target_key)
+    # A gateway retry skips inject. The first submit already resumed the session, so inject would
+    # be a second copy of a message the gateway still has under this request_id (R3-01).
+    skip_inject = _classic_cli_host(ctx) or not injectable or ws_retry
+    accepted = False if skip_inject else _inject(ctx, payload, target_key)
 
     if (
         not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"]
@@ -1056,7 +1065,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
         if mounted_ok:
             mounted_dormant = True
-            accepted = False if _classic_cli_host(ctx) else _inject(ctx, payload, target_key)
+            accepted = False if (_classic_cli_host(ctx) or ws_retry) else _inject(ctx, payload, target_key)
 
     ws_err = ""
     admission_id = ""
@@ -1086,12 +1095,17 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
                 _OPERATIONS.pop(send_token, None)
+        else:
+            # The call has returned. Keeping the claim would make the retry the message asks for
+            # come back as request_in_flight for the life of the process (R3-02).
+            with _LOCK:
+                _OPERATIONS.pop(send_token, None)
         unknown = in_flight and bool(ws_err)
         result: dict[str, Any] = {
             "ok": False,
             "error": (
                 "surface_cannot_route"
-                if _classic_cli_host(ctx) and not gateway_granted
+                if _classic_cli_host(ctx) and (not gateway_granted or not dormant_local)
                 else "delivery_unknown" if unknown else "injection_refused"
             ),
             "request_id": send_token,

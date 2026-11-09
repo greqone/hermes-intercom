@@ -1118,7 +1118,7 @@ def sanitize_card_sender(raw_label: str) -> str:
 # Directives the host expands inside the receiving session's workspace
 # (gateway/session_context_refs.py). A delivered body must not carry them.
 _DIRECTIVE_RE = re.compile(
-    r"@+(file|folder|diff|git|url):|@(diff|staged)\b",
+    r"@+(file|folder|diff|git|url):|@+(diff|staged)\b",
     re.IGNORECASE,
 )
 
