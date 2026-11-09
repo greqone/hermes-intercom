@@ -30,7 +30,7 @@ load_plugin_package()
 
 
 class _RepoRootIsNotATestPackage:
-    @pytest.hookimpl(tryfirst=True)
+    @pytest.hookimpl(tryfirst=True, optionalhook=True)
     def pytest_collect_directory(self, path, parent):
         if Path(path).resolve() == _ROOT:
             return pytest.Dir.from_parent(parent, path=path)
@@ -47,6 +47,7 @@ def _clear_delivery_state() -> None:
     with delivery._LOCK:
         delivery._RECENT_SENDS.clear()
         delivery._TURN_HOP.clear()
+        delivery._OPERATIONS.clear()
 
 
 @pytest.fixture(autouse=True)

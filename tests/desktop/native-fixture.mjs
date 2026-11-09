@@ -156,7 +156,7 @@ export function renderNativeMessage(doc, rawText, { avatar = null, messageId = '
 
 /** Real producer strings from store.format_intercom_message (no hand-copied hints). */
 export function formatViaPython(cases) {
-  const python = process.env.HERMES_PYTHON || 'python'
+  const python = process.env.HERMES_PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
   const script = [
     'import json, sys',
     `sys.path.insert(0, ${JSON.stringify(PACKAGE_ROOT)})`,
@@ -210,7 +210,10 @@ export async function loadPlugin() {
   if (!fs.existsSync(PLUGIN_PATH)) {
     return { id: 'hermes-intercom', name: 'no-op baseline (desktop/plugin.js absent)', register() {}, baseline: true }
   }
-  const mod = await import(pathToFileURL(PLUGIN_PATH).href + `?t=${Date.now()}`)
+  // Node 20.0.0 rejects `export` in a file-URL .js import (ERR_UNEXPECTED_TOKEN). The desktop host
+  // loads this file as a module itself; the fixture has to say so explicitly to exercise the same bytes.
+  const source = fs.readFileSync(PLUGIN_PATH, 'utf8')
+  const mod = await import(`data:text/javascript,${encodeURIComponent(source)}`)
   return mod.default
 }
 

@@ -1253,8 +1253,10 @@ def test_a_quoted_card_cannot_raise_the_hop_of_a_leading_card() -> None:
     )
     assert store.parse_intercom_tag(real + chr(10) + quoted) == (1, 3)
     # A queued prompt in front of the real card still counts, and a quote after it does not.
-    prepended = "queued prompt" + chr(10) + real + chr(10) + quoted
+    prepended = "[Queued prompt for local-a]" + chr(10) + real + chr(10) + quoted
     assert store.parse_intercom_tag(prepended) == (1, 3)
+    # Ordinary prose before a card is a person quoting it, which must not move the hop.
+    assert store.parse_intercom_tag("what about this?" + chr(10) + real) == (0, 0)
 
 
 
@@ -1397,6 +1399,7 @@ def test_reply_to_compressed_ancestor_id_resolves_live_continuation(
         title="Alpha after compression",
         message_count=6,
         last_activity_at=1900.0,
+        session_key="agent:main:local:dm:local-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     )
 
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1440,6 +1443,7 @@ def test_title_local_ab_does_not_hijack_id_prefix(
         title="Actual prefix target",
         message_count=5,
         last_activity_at=1700.0,
+        session_key=f"agent:main:local:dm:{prefix_target}",
     )
 
     monkeypatch.setenv("HERMES_HOME", str(home))

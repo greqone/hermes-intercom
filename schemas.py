@@ -49,8 +49,11 @@ SESSION_SEND_SCHEMA: dict = {
     "name": "session_send",
     "description": (
         "Send a message to another Hermes session in the same profile (by session_id, prefix, session_key, "
-        "or unique title substring). Wakes an idle target session as a new turn or queues into the target's "
-        "durable FIFO if busy. Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
+        "or unique title substring). Wakes an idle target session as a new turn or, when the target is "
+        "busy, hands the message to the host scheduler. The result says `scheduled` when the host "
+        "accepted it for scheduling, or `admitted` when the gateway WebSocket fallback holds an "
+        "admission record. Neither is a durable queue and neither promises the turn will run. "
+        "Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
         "loop protection so two sessions can exchange a bounded reply without infinite ping-pong."
     ),
     "parameters": {
@@ -80,10 +83,10 @@ SESSION_SEND_SCHEMA: dict = {
                 "type": "string",
                 "description": (
                     "Optional retry identity, 1-1024 characters. Pass the request_id from an earlier "
-                    "unknown or admitted result to resend that same operation: the gateway collapses "
-                    "a repeat of the same id and refuses it when the payload differs. Omit it for a "
-                    "new send, which gets its own id. This is the gateway's admission key, not an "
-                    "exactly-once guarantee this plugin can make on its own."
+                    "result to retry that same operation: an identical retry returns the first outcome "
+                    "without delivering again, and a different message under the same id is refused. "
+                    "Omit it for a new send. This identifies one operation inside this process; it is "
+                    "not an exactly-once guarantee across restarts."
                 ),
             },
         },

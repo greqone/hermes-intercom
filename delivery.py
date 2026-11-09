@@ -28,6 +28,13 @@ _RECENT_SENDS: dict[tuple[str, str], list[tuple[float, str, str, str]]] = {}
 # (home_str, session_id) -> (inbound hop, sender max_hops, ts_monotonic)
 _TURN_HOP: dict[tuple[str, str], tuple[int, int, float]] = {}
 
+_MESSAGE_MAX_CHARS = 32 * 1024
+
+# One operation, keyed by request_id, so a retry replays the first outcome instead of delivering
+# again. ``payload_hash`` is the body as accepted; a different body under the same id conflicts.
+_OPERATIONS: dict[str, dict[str, Any]] = {}
+_OPERATION_MAX = 4096
+
 # Bounds for the inbound-hop memory so long-running Gateway processes never leak (W213a).
 _TURN_HOP_MAX = 1024
 _TURN_HOP_TTL = 3600.0
@@ -457,7 +464,7 @@ def submit_via_gateway_ws(
             except BaseException as exc:  # noqa: BLE001 - an admission receipt beats any transport error
                 if admission_id:
                     return True, admission_id
-                label = _exc_label(exc)
+                label = _classify_ws_exception(exc)
                 return False, label if submit_started else f"pre_submit:{label}"
 
         if admission_id:
@@ -467,12 +474,34 @@ def submit_via_gateway_ws(
     return _run_coro_sync(_submit_coro, timeout=timeout)
 
 
+def _classify_ws_exception(exc: BaseException) -> str:
+    """Map a gateway exception to a label ``_ws_error_in_flight`` can trust.
+
+    ``GatewayRPCError`` is an owner refusal and ``GatewayClientError(NOT_SENT)`` proves the frame
+    never left. Both roll back. Anything else keeps the reservation, because it may have landed.
+    """
+    name = type(exc).__name__
+    if name == "GatewayRPCError":
+        return f"rpc_refused:{_exc_label(exc)}"
+    if name == "GatewayClientError" and "nothing was sent" in str(exc):
+        return f"not_sent:{_exc_label(exc)}"
+    return _exc_label(exc)
+
+
 def _ws_error_in_flight(ws_err: str) -> bool:
-    """True when a WS failure may still have queued the prompt, so its dedup entry must stay."""
+    """True when a WS failure may still have queued the prompt, so its reservation must stay.
+
+    An owner refusal (``GatewayRPCError``: ``queue_full``, ``permission_denied``, ``runtime_draining``)
+    and ``NOT_SENT`` proved nothing was queued, so they roll back like the deterministic prefixes.
+    """
     label = (ws_err or "").strip()
     if not label:
         return False
-    return not label.startswith(_DETERMINISTIC_WS_ERROR_PREFIXES)
+    if label.startswith(_DETERMINISTIC_WS_ERROR_PREFIXES):
+        return False
+    if label.startswith(("rpc_refused:", "not_sent:")):
+        return False
+    return True
 
 
 def _message_text(user_message: Any) -> str:
@@ -728,14 +757,21 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         )
 
     target_arg = _sanitize_utf8(raw_target or "").strip()
-    message_body = _sanitize_utf8(raw_message or "").strip()
+    message_body = _sanitize_utf8(raw_message or "")
     expect_reply = _parse_bool(params.get("expect_reply", False), False)
     sender_label_override = _sanitize_label_override(_sanitize_utf8(raw_label or ""))
 
     if not target_arg:
         return _json({"ok": False, "error": "missing_target", "message": "target is required"})
-    if not message_body:
+    if not message_body.strip():
         return _json({"ok": False, "error": "empty_message", "message": "message must not be empty"})
+    if len(message_body) > _MESSAGE_MAX_CHARS:
+        return _json({
+            "ok": False,
+            "error": "message_too_large",
+            "message": f"message exceeds {_MESSAGE_MAX_CHARS} characters.",
+            "max_chars": _MESSAGE_MAX_CHARS,
+        })
     if ctx is None or not hasattr(ctx, "inject_message"):
         return _json(
             {
@@ -862,6 +898,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
     send_token = supplied_request or uuid.uuid4().hex
+    payload_hash = hashlib.sha256(message_body.encode("utf-8")).hexdigest()
     wall_now = time.time()
     burst_win = cfg["burst_window_seconds"]
     dedup_win = cfg["dedup_window_seconds"]
@@ -870,6 +907,16 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     keep_win = max(burst_win, dedup_win)
 
     with _LOCK:
+        prior = _OPERATIONS.get(send_token)
+        if prior is not None and prior.get("payload_hash") != payload_hash:
+            return _json({
+                "ok": False,
+                "error": "request_conflict",
+                "request_id": send_token,
+                "message": "request_id was already used with a different message.",
+            })
+        if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
+            return _json({**prior["result"], "replayed": True})
         _evict_stale_send_buckets(now_mono, keep_win)
         history = _recent_sends_for(bucket_key, now_mono, keep_win)
         if dedup_win > 0 and any(
@@ -883,8 +930,12 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     "message": f"Identical message already sent to {resolved['session_id']} within {dedup_win}s.",
                 }
             )
-        burst_count = sum(1 for ts, _sender, _d, _tok in history if (now_mono - ts) < burst_win)
-        if burst_count >= max_per_win:
+        # Burst counts operations, not attempts: a retry of one request_id must not spend a second
+        # slot, and it must still be deliverable when the window is already full (D04).
+        seen_tokens = {
+            tok for ts, _sender, _d, tok in history if tok and (now_mono - ts) < burst_win
+        }
+        if send_token not in seen_tokens and len(seen_tokens) >= max_per_win:
             return _json(
                 {
                     "ok": False,
@@ -892,15 +943,16 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     "message": f"Rate limit reached: {max_per_win} messages to {resolved['session_id']} within {burst_win}s.",
                 }
             )
-        # Reserved before the blocking delivery on purpose. While inject_message or the gateway
-        # call is in flight the lock is released, and a second identical send in that window must
-        # see this entry. Reserving only after success lets both land.
-        history.append((now_mono, caller_sid, digest, send_token))
+        if not any(tok == send_token for _ts, _sender, _d, tok in history):
+            history.append((now_mono, caller_sid, digest, send_token))
         _RECENT_SENDS[bucket_key] = history
 
     sender_info = store.lookup_sender_info(home, caller_sid, ns=ns, caller_session_key=caller_key)
+    real_short = sender_info["short_id"]
     if sender_label_override:
         card_label = sender_label_override
+        if real_short and real_short not in card_label:
+            card_label = f"{card_label} ({real_short})"
     elif sender_info["title"]:
         title_short = sender_info["title"][:38].strip()
         card_label = f"{title_short} ({sender_info['short_id']})"
@@ -938,9 +990,12 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         if mounted_ok:
             mounted_dormant = True
 
-    accepted = False if _classic_cli_host(ctx) else _inject(ctx, payload, target_key)
+    # A synthesized key that did not mount is not a route. Injecting it reports success for a
+    # message the gateway drops, so it never happens (D03).
+    injectable = routed or mounted_dormant
+    accepted = False if (_classic_cli_host(ctx) or not injectable) else _inject(ctx, payload, target_key)
 
-    if not accepted and not mounted_dormant and cfg["auto_mount_dormant"] and dormant_local:
+    if not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"] and dormant_local:
         # Routed but not mounted in authority.sessions right now: core returns False synchronously.
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
         if mounted_ok:
@@ -962,7 +1017,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     if not accepted:
         # A timed-out/unproven WS submit may still land in the target queue: keep the dedup entry so
         # an immediate retry cannot double-deliver. Only deterministic refusals are rolled back.
-        if not _ws_error_in_flight(ws_err):
+        in_flight = _ws_error_in_flight(ws_err)
+        if not in_flight:
             with _LOCK:
                 remaining = [
                     entry
@@ -973,13 +1029,18 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     _RECENT_SENDS[bucket_key] = remaining
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
+        unknown = in_flight and bool(ws_err)
         result: dict[str, Any] = {
             "ok": False,
-            "error": "injection_refused",
+            "error": "delivery_unknown" if unknown else "injection_refused",
+            "request_id": send_token,
             "target_session_id": resolved["session_id"],
             "target_session_key": target_key,
             "mounted_dormant": mounted_dormant,
             "message": (
+                "The gateway did not confirm this delivery. Retry with the same request_id; "
+                "it will not be delivered twice."
+                if unknown else
                 "Gateway refused message injection. Ensure "
                 "plugins.entries.hermes-intercom.allow_gateway_injection: true is set in config.yaml "
                 "and the target session belongs to this profile."
@@ -1005,26 +1066,34 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     }
     _append_audit(home, audit_row)
 
-    return _json(
-        {
-            "ok": True,
-            "status": "admitted" if delivery_method == "gateway_ws" else "scheduled",
+    result = {
+        "ok": True,
+        "status": "admitted" if delivery_method == "gateway_ws" else "scheduled",
+        "delivery_method": delivery_method,
+        "from_session_id": sender_info["session_id"],
+        "target_session_id": resolved["session_id"],
+        "target_title": resolved["title"],
+        "target_session_key": target_key,
+        "hop": next_hop,
+        "max_hops": max_hops,
+        "expect_reply": expect_reply,
+        "mounted_dormant": mounted_dormant,
+        "request_id": send_token,
+        "admission_id": admission_id,
+        "note": (
+            "The gateway accepted this prompt into the target session."
+            if delivery_method == "gateway_ws" else
+            "The host scheduled this turn. inject_message confirms scheduling, not a durable "
+            "admission, so a later refusal is reported by the gateway log rather than here."
+        ),
+    }
+    with _LOCK:
+        if len(_OPERATIONS) >= _OPERATION_MAX:
+            _OPERATIONS.pop(next(iter(_OPERATIONS)), None)
+        _OPERATIONS[send_token] = {
+            "payload_hash": payload_hash,
+            "delivered": True,
             "delivery_method": delivery_method,
-            "from_session_id": sender_info["session_id"],
-            "target_session_id": resolved["session_id"],
-            "target_title": resolved["title"],
-            "target_session_key": target_key,
-            "hop": next_hop,
-            "max_hops": max_hops,
-            "expect_reply": expect_reply,
-            "mounted_dormant": mounted_dormant,
-            "request_id": send_token,
-            "admission_id": admission_id,
-            "note": (
-                "The gateway accepted this prompt into the target session."
-                if delivery_method == "gateway_ws" else
-                "The host scheduled this turn. inject_message confirms scheduling, not a durable "
-                "admission, so a later refusal is reported by the gateway log rather than here."
-            ),
+            "result": result,
         }
-    )
+    return _json(result)
