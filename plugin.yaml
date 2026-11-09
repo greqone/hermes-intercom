@@ -1,0 +1,74 @@
+name: hermes-intercom
+version: 0.1.0
+description: >
+  Cross-session discovery and inter-agent messaging for Hermes Agent (Desktop,
+  TUI, CLI, and messaging channels). Discovers sessions via a read-only, schema
+  tolerant state.db (missing optional columns and compression continuations are
+  handled), reports whether each session has a real gateway route or only a
+  synthesized agent:<ns>:local:dm:<id> key, auto-mounts dormant local
+  (`:local:dm:`) sessions through the profile gateway authority when injection is
+  refused, and for external processes falls back to `prompt.submit` over the
+  local Gateway WebSocket when `allow_gateway_injection: true`. Delivers attributed agent cards through ctx.inject_message with multi-hop loop
+  protection and per-sender, expect_reply-aware deduplication. A classic CLI
+  host (ctx.session_surface() == cli) cannot honor a session_key, so delivery
+  falls back to the local gateway prompt.submit path instead of the sender's REPL.
+  The desktop half renders nothing: the SDK has no incoming-message slot and
+  catalog rule 8 forbids rewriting the host note.
+author: GreQ, Hermes Agent
+license: MIT
+requires_hermes: ">=0.22.5"
+tags: [intercom, sessions, multi-agent, messaging, automation]
+provides_tools:
+  - session_list
+  - session_send
+provides_hooks:
+  - pre_llm_call
+config_schema:
+  max_hops:
+    type: int
+    default: 3
+    minimum: 1
+    maximum: 10
+    description: >
+      Maximum autonomous intercom hops before requiring a human turn. A reply that
+      would exceed it is refused with error=max_hops_exceeded instead of sending.
+  dedup_window_seconds:
+    type: int
+    default: 120
+    minimum: 0
+    maximum: 3600
+    description: >
+      Seconds within which a repeat send to the same target is dropped with
+      error=duplicate_message. The fingerprint is per sender session + expect_reply
+      flag + message body, so the same text from another session, or with
+      expect_reply flipped, is not a duplicate. 0 disables deduplication.
+  burst_window_seconds:
+    type: int
+    default: 600
+    minimum: 1
+    maximum: 86400
+    description: Sliding window in seconds for per-target rate limiting; messages from every sender count toward it
+  max_messages_per_window:
+    type: int
+    default: 10
+    minimum: 1
+    maximum: 200
+    description: Maximum intercom messages from any senders to one target within burst_window_seconds; over-limit sends fail with error=rate_limited
+  auto_mount_dormant:
+    type: bool
+    default: true
+    description: >
+      When ctx.inject_message refuses a `:local:dm:` target, mount that session in
+      the gateway authority (session.resume with omit_messages, then
+      session.detach) and retry the injection once.
+  mount_timeout_seconds:
+    type: float
+    default: 8.0
+    minimum: 1.0
+    maximum: 60.0
+    description: >
+      Overall seconds budget for one gateway operation, not per step: gateway endpoint
+      discovery, session.resume and session.detach all share a single deadline for the
+      dormant mount, and the external-process WebSocket fallback (resume + prompt.submit +
+      detach) gets its own identical budget. A timed-out submit is treated as in-flight so
+      an immediate retry is not delivered twice.
