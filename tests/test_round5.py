@@ -397,3 +397,12 @@ def test_r5_a02_a_host_ref_object_stays_a_session_id(tmp_path, monkeypatch) -> N
     result = _send(ctx, target="local-target-0001", message="hello", request_id="ref-1")
     assert result["ok"] is True
     assert result["reference"] == "local-target-0001"
+
+
+def test_r4_d06_a_refused_send_forgets_its_bucket_horizon(tmp_path) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    plugin = _load_plugin()
+    result = _send(ctx, target="local-target-0001", message="nope")
+    assert result["ok"] is False
+    assert plugin.delivery._BUCKET_HORIZON == {}

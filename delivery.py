@@ -1237,6 +1237,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     _RECENT_SENDS[bucket_key] = remaining
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
+                    _BUCKET_HORIZON.pop(bucket_key, None)
                 # A confirmed or unconfirmed gateway attempt keeps its transport. A later retry
                 # must go back to the gateway, not through inject_message (R4-D01).
                 kept = _OPERATIONS.get(send_token)
