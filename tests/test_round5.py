@@ -332,3 +332,27 @@ def test_r5_a_compressed_ancestor_does_not_resolve_to_an_archived_child(tmp_path
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "local-old", caller_session_id="local-caller-0001")
     assert resolved is None and ambiguous == []
+
+
+def test_r5_b03_an_auto_closed_continuation_still_resolves(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "compression", 1, "Old", 0,
+         "agent:main:local:dm:local-old", 2.0),
+        ("local-child", "local", "m", "local-old", 3.0, 4.0, "tui_shutdown", 1, "Child", 0,
+         "agent:main:local:dm:local-child", 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, _ambiguous = plugin.store.resolve_target(home, "local-old", caller_session_id="local-caller-0001")
+    assert resolved is not None and resolved["session_id"] == "local-child"
+
+
+def test_r5_b02_another_session_does_not_inherit_the_replay(tmp_path) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="shared-id")
+    assert first["ok"] is True
+
+    other = _send(ctx, target="local-target-0001", message="hello", request_id="shared-id",
+                  caller="local-caller-0002")
+    assert other.get("replayed") is not True
+    assert other["error"] == "request_conflict"

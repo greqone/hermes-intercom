@@ -60,6 +60,10 @@ _COMPRESSED_END_REASONS = frozenset({"compression", "compressed"})
 # A row ended for any of these keeps the key the live conversation now owns. Naming it delivers
 # into the new conversation while the result still quotes the old id (R5-S01).
 _RESET_END_REASONS = frozenset({"session_reset", "idle", "daily"})
+_AUTOMATIC_END_REASONS = frozenset({
+    "agent_close", "ws_orphan_reap", "superseded_by_resume", "startup_orphan_reap",
+    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict",
+})
 
 
 
@@ -470,6 +474,7 @@ def query_sessions(
             "_archived": archived != 0 or hidden != 0,
             "_cron": is_cron,
             "_active": item_active,
+            "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
         }
 
         dedup_key = skey or sid
@@ -643,10 +648,14 @@ def _ancestor_descendants(
     candidates = [c for c in candidates if c["session_id"].lower() != needle_low]
     candidates = [c for c in candidates if c["session_id"].lower() not in branched]
     live = [
-        c for c in candidates if not c.get("_archived") and not c.get("_cron") and c.get("_active", True)
+        c for c in candidates
+        if not c.get("_archived") and not c.get("_cron")
+        and (c.get("_active", True) or c.get("_end_reason") in _AUTOMATIC_END_REASONS)
     ]
-    # An archived or cron descendant is not a conversation to deliver into. Falling back to it
-    # made a compressed ancestor resolve to a session the user had already closed (Finding C).
+    # An archived or cron descendant is not a conversation to deliver into, and neither is one the
+    # user deliberately ended. A descendant closed by automatic cleanup is resumable: the host clears
+    # that stamp on the next compression (hermes_state_common.py, _AUTOMATIC_END_REASONS). Dropping
+    # those made a compressed ancestor resolve to nothing (R5B-03).
     return live
 
 

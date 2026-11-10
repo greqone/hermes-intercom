@@ -889,6 +889,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             and prior_early.get("body") == message_body
             and bool(prior_early.get("expect_reply")) == bool(expect_reply)
             and prior_early["result"].get("target_session_id") == target_arg
+            and prior_early["result"].get("from_session_id") == caller_sid
         ):
             return _json({**prior_early["result"], "replayed": True})
 
