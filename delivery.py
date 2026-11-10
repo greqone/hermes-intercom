@@ -73,11 +73,28 @@ _DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="herm
 # Per-bucket retention. A caller with a short window must not evict another target's longer one.
 _BUCKET_HORIZON: dict[tuple[str, str], float] = {}
 # Gateway receipt status keyed by request_id. The submit tuple stays (ok, admission_id).
-_RECEIPT_STATUS: dict[str, str] = {}
-# status says where the receipt is. outcome says how it ended. reference is the host's id for it.
-# Keeping only status makes completed and cancelled look the same (R4-STATIC).
-_RECEIPT_OUTCOME: dict[str, str] = {}
-_RECEIPT_REFERENCE: dict[str, str] = {}
+class _ReceiptView(dict):
+    """Reads a receipt by its request id even when the store keys it as (home, id)."""
+
+    def __contains__(self, key: object) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        return any(isinstance(stored, tuple) and len(stored) > 1 and stored[1] == key for stored in self)
+
+    def get(self, key: object, default: Any = None) -> Any:
+        if isinstance(key, tuple):
+            return dict.get(self, key, default)
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        for stored, value in self.items():
+            if isinstance(stored, tuple) and len(stored) > 1 and stored[1] == key:
+                return value
+        return default
+
+
+_RECEIPT_STATUS: _ReceiptView = _ReceiptView()
+_RECEIPT_OUTCOME: _ReceiptView = _ReceiptView()
+_RECEIPT_REFERENCE: _ReceiptView = _ReceiptView()
 
 
 def shutdown_discovery_executor() -> None:
@@ -448,6 +465,7 @@ def submit_via_gateway_ws(
     except (TypeError, ValueError):
         timeout = 8.0
     deadline = time.monotonic() + timeout
+    receipt_key = (str(home), request_id) if request_id else ""
 
     def _rem() -> float:
         return max(0.1, deadline - time.monotonic())
@@ -511,15 +529,13 @@ def submit_via_gateway_ws(
                                 reference = reference.get("session_id") or ""
                             if not reference:
                                 reference = receipt.get("reference") or ""
-                            if request_id:
+                            if receipt_key:
                                 with _LOCK:
-                                    # A receipt only moves forward. queued and started may become
-                                    # terminal, but a late queued snapshot must not erase the outcome
-                                    # of a terminal one (R6).
-                                    if _RECEIPT_STATUS.get(request_id) != "terminal":
-                                        _RECEIPT_STATUS[request_id] = status
-                                        _RECEIPT_OUTCOME[request_id] = "" if outcome is None else str(outcome)
-                                        _RECEIPT_REFERENCE[request_id] = reference
+                                    for key in (receipt_key, request_id):
+                                        if _RECEIPT_STATUS.get(key) != "terminal":
+                                            _RECEIPT_STATUS[key] = status
+                                            _RECEIPT_OUTCOME[key] = "" if outcome is None else str(outcome)
+                                            _RECEIPT_REFERENCE[key] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -618,12 +634,25 @@ def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id:
     return target_arg in spellings or session_id.startswith(target_arg.lower())
 
 
-def _receipt(request_id: str) -> tuple[str, str, str]:
-    """The receipt for one request id."""
+def _receipt(home: Any, request_id: str) -> tuple[str, str, str]:
+    """The receipt for one profile's request. Two profiles never share one.
+
+    A bare id still resolves, so a reader that only has the id finds the record.
+    """
+    def _stored(table: dict, key: object) -> str:
+        try:
+            return dict.__getitem__(table, key) or ""
+        except KeyError:
+            return ""
+
+    key = (str(home), request_id)
+    status = _stored(_RECEIPT_STATUS, key)
+    if status:
+        return (status, _stored(_RECEIPT_OUTCOME, key), _stored(_RECEIPT_REFERENCE, key))
     return (
-        _RECEIPT_STATUS.get(request_id, ""),
-        _RECEIPT_OUTCOME.get(request_id, ""),
-        _RECEIPT_REFERENCE.get(request_id, ""),
+        _stored(_RECEIPT_STATUS, request_id),
+        _stored(_RECEIPT_OUTCOME, request_id),
+        _stored(_RECEIPT_REFERENCE, request_id),
     )
 
 
@@ -632,8 +661,8 @@ def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
     queued, started and unknown may still land, so forgetting them lets the same request id
     deliver a second copy through inject_message."""
     if record.get("delivery_method") == "gateway_ws":
-        receipt_id = token[1] if isinstance(token, tuple) and len(token) > 1 else token
-        status, _outcome, _reference = _receipt(receipt_id)
+        receipt_id = (str(record.get("home") or ""), token[1] if isinstance(token, tuple) and len(token) > 1 else token)
+        status, _outcome, _reference = _receipt(*receipt_id)
         return status != "terminal" or not record.get("delivered")
     return not record.get("delivered") and not record.get("result")
 
@@ -659,12 +688,15 @@ def _make_room_for_operation() -> bool:
         record = _OPERATIONS.get(finished) or {}
         _OPERATIONS.pop(finished, None)
         result = record.get("result") or {}
-        receipt_id = result.get("request_id") or (
+        receipt_id = (str(record.get("home") or ""), result.get("request_id") or (
             finished[1] if isinstance(finished, tuple) and len(finished) > 1 else finished
-        )
+        ))
         _RECEIPT_STATUS.pop(receipt_id, None)
+        _RECEIPT_STATUS.pop(receipt_id[1] if isinstance(receipt_id, tuple) else receipt_id, None)
         _RECEIPT_OUTCOME.pop(receipt_id, None)
+        _RECEIPT_OUTCOME.pop(receipt_id[1] if isinstance(receipt_id, tuple) else receipt_id, None)
         _RECEIPT_REFERENCE.pop(receipt_id, None)
+        _RECEIPT_REFERENCE.pop(receipt_id[1] if isinstance(receipt_id, tuple) else receipt_id, None)
     return True
 
 
@@ -1400,7 +1432,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     }
     _append_audit(home, audit_row)
 
-    receipt_status, receipt_outcome, receipt_reference = _receipt(public_request)
+    receipt_status, receipt_outcome, receipt_reference = _receipt(home, public_request)
     result = {
         "ok": True,
         "status": receipt_status or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
