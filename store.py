@@ -1162,7 +1162,7 @@ def parse_intercom_tag(text: str | None) -> tuple[int, int]:
             found = _INTERCOM_CARD_LINE_RE.match(stripped)
             return _tag_ints(found) if found is not None else (0, 0)
         # Only a host queued-prompt marker may precede the card. Real text means the card is a quote.
-        if not stripped.startswith("[Queued prompt"):
+        if not stripped.startswith(("[Queued prompt", "[STILL IN PROGRESS")):
             return 0, 0
     return 0, 0
 

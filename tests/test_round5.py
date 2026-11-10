@@ -1110,3 +1110,22 @@ def test_r6_a_genuine_ask_after_the_summary_renews_the_budget(tmp_path) -> None:
     con.close()
     result = _send(ctx, target="local-target-0001", message="hello")
     assert result["ok"] is True and result["hop"] == 1, result
+
+
+def test_r6_an_inflight_restatement_keeps_the_exhausted_hop(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    restated = (
+        "[STILL IN PROGRESS — this is the active request, restated after the "
+        "compaction boundary because it was not finished yet. Continue it; do not "
+        "start over.]\n" + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
+        ("local-caller-0001", restated, 1.0),
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is False and result["error"] == "max_hops_exceeded", result
