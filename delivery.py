@@ -95,6 +95,9 @@ class _ReceiptView(dict):
 _RECEIPT_STATUS: _ReceiptView = _ReceiptView()
 _RECEIPT_OUTCOME: _ReceiptView = _ReceiptView()
 _RECEIPT_REFERENCE: _ReceiptView = _ReceiptView()
+# A receipt only moves forward. queued and started may become terminal. A late snapshot of an
+# earlier state never replaces a later one, so started does not fall back to queued.
+_RECEIPT_RANK = {"queued": 1, "admitted": 1, "started": 2, "terminal": 3}
 
 
 def shutdown_discovery_executor() -> None:
@@ -531,7 +534,7 @@ def submit_via_gateway_ws(
                                 reference = receipt.get("reference") or ""
                             if receipt_key:
                                 with _LOCK:
-                                    if _RECEIPT_STATUS.get(receipt_key) != "terminal":
+                                    if _RECEIPT_RANK.get(status, 0) > _RECEIPT_RANK.get(_RECEIPT_STATUS.get(receipt_key, ""), 0):
                                         _RECEIPT_STATUS[receipt_key] = status
                                         _RECEIPT_OUTCOME[receipt_key] = "" if outcome is None else str(outcome)
                                         _RECEIPT_REFERENCE[receipt_key] = reference
