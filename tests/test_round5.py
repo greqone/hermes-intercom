@@ -289,10 +289,15 @@ def test_r5_s02_a_summary_row_does_not_reset_the_hop_budget(tmp_path) -> None:
     card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
     con = sqlite3.connect(str(home / "state.db"))
     con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
     con.execute(
         "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary) "
-        "VALUES ('local-caller-0001', 'user', ?, 2.0, 1)",
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, 0)",
         (card,),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES ('local-caller-0001', 'user', 'summary of the earlier turns', 2.0, 1, 'hidden')"
     )
     con.commit()
     con.close()

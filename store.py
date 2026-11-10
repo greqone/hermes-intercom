@@ -1116,9 +1116,12 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
             seen.add(current)
             where = "session_id = ?" + (" AND role = 'user'" if has_role else "")
             # A pure compression summary is not a turn, so it must not hide the parent's card
-            # (S-R02). A carrier that still holds a real user ask is a turn: the host marks it
-            # with _compressed_summary_has_user_turn. Skipping every flagged row would drop that ask.
-            if "_compressed_summary" in msg_cols and "_compressed_summary_has_user_turn" in msg_cols:
+            # (S-R02). The host never stores _compressed_summary_has_user_turn: it hides a standalone
+            # summary with display_kind = 'hidden' (agent/session_persistence.py). A carrier that still
+            # holds a real user ask keeps its visibility, so skipping only the hidden rows keeps that ask.
+            if "display_kind" in msg_cols:
+                where += " AND COALESCE(display_kind, '') != 'hidden'"
+            elif "_compressed_summary" in msg_cols and "_compressed_summary_has_user_turn" in msg_cols:
                 where += (
                     " AND (COALESCE(_compressed_summary, 0) = 0"
                     " OR COALESCE(_compressed_summary_has_user_turn, 0) != 0)"
