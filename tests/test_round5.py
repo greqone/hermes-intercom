@@ -317,6 +317,113 @@ def test_r5_d05_b_a_late_queued_reply_does_not_keep_the_terminal_outcome(tmp_pat
     assert plugin.delivery._RECEIPT_OUTCOME.get("receipt-order") == "cancelled"
 
 
+def test_r6_a_late_queued_reply_does_not_erase_a_terminal_receipt(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "terminal", "outcome": "cancelled", "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "queued", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-back")
+    second = _send(ctx, target="local-target", message="hello", request_id="receipt-back")
+    assert first.get("admission_status") == "terminal", first
+    assert second.get("admission_status") == "terminal", second
+    assert plugin.delivery._RECEIPT_STATUS.get("receipt-back") == "terminal"
+    assert plugin.delivery._RECEIPT_OUTCOME.get("receipt-back") == "cancelled"
+
+
+def test_r6_a_gateway_retry_by_prefix_does_not_submit_again(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls = {"n": 0}
+
+    def _ok(*_a, **kwargs):
+        calls["n"] += 1
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-prefix")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    retry = _send(ctx, target="local-target", message="hello", request_id="gw-prefix")
+    assert retry.get("replayed") is True, retry
+    assert calls["n"] == 1
+
+
+def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-a"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, "session_reset", 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == [], (resolved, ambiguous)
+
+
+def test_r6_a_nested_carrier_keeps_the_outer_card(tmp_path) -> None:
+    home = _home(tmp_path)
+    plugin = _load_plugin()
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    inner = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\nold turn\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] older\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    nested = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\n" + inner + "\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
+        + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, display_kind) "
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, NULL)",
+        (nested,),
+    )
+    con.commit()
+    con.close()
+    assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (3, 3)
+
+
 def test_r6_two_gateway_retries_do_not_both_submit(tmp_path, monkeypatch) -> None:
     _home_unused, ctx = _pair(tmp_path)
     ctx._allow_inject = False

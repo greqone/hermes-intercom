@@ -898,11 +898,13 @@ def resolve_target(
         _with_internal=True,
     )
 
-    # Tier 1 - exact session id / root id / gateway session key.
+    # Tier 1 - exact session id / gateway session key. The root id is excluded on purpose:
+    # a descendant inherits its ancestor's root, so matching it here returns the live child of
+    # a conversation the host already ended (R6).
     exact_id = [
         s
         for s in all_sessions
-        if needle_low in (s["session_id"].lower(), s["root_session_id"].lower(), s["session_key"].lower())
+        if needle_low in (s["session_id"].lower(), s["session_key"].lower())
     ]
     if exact_id:
         if len(exact_id) == 1:
@@ -1052,13 +1054,13 @@ def _unwrap_carrier(text: str) -> str:
     follows the end marker. Either way the card that decides the hop sits outside the summary, and
     reading the wrapped string finds no leading card, so an exhausted chain sends again at hop 1.
     """
-    if "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]" in text:
-        head = text.split("[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]", 1)[0]
-        header = "[PRIOR CONTEXT — for reference only; not a new message]"
-        return head.replace(header, "", 1).strip()
     marker = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
     if marker in text:
-        return text.split(marker, 1)[1].strip()
+        return text.rsplit(marker, 1)[1].strip()
+    if "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]" in text:
+        head, _tail = text.rsplit("[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]", 1)
+        header = "[PRIOR CONTEXT — for reference only; not a new message]"
+        return head.replace(header, "", 1).strip()
     return text
 
 

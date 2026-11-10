@@ -493,9 +493,13 @@ def submit_via_gateway_ws(
                                 reference = receipt.get("reference") or ""
                             if request_id:
                                 with _LOCK:
-                                    _RECEIPT_STATUS[request_id] = status
-                                    _RECEIPT_OUTCOME[request_id] = "" if outcome is None else str(outcome)
-                                    _RECEIPT_REFERENCE[request_id] = reference
+                                    # A receipt only moves forward. queued and started may become
+                                    # terminal, but a late queued snapshot must not erase the outcome
+                                    # of a terminal one (R6).
+                                    if _RECEIPT_STATUS.get(request_id) != "terminal":
+                                        _RECEIPT_STATUS[request_id] = status
+                                        _RECEIPT_OUTCOME[request_id] = "" if outcome is None else str(outcome)
+                                        _RECEIPT_REFERENCE[request_id] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -570,14 +574,24 @@ def _message_text(user_message: Any) -> str:
 
 
 def _same_operation_target(record: dict[str, Any], target_arg: str) -> bool:
-    """The retry names the same conversation the first call resolved, however it spelled it."""
+    """The retry names the same conversation the first call resolved, however it spelled it.
+
+    A prefix of at least six characters counts: that is the length the resolver itself treats as
+    an id prefix, and a retry that uses one must not be sent to the gateway a second time.
+    """
     result = record.get("result") or {}
-    return target_arg in (
-        record.get("target_text"),
-        result.get("target_session_id"),
-        result.get("target_title"),
-        result.get("target_session_key"),
-    )
+    spellings = [
+        record.get("target_text") or "",
+        result.get("target_session_id") or "",
+        result.get("target_title") or "",
+        result.get("target_session_key") or "",
+    ]
+    if target_arg in spellings:
+        return True
+    needle = target_arg.lower()
+    if len(needle) < store.MIN_ID_PREFIX_LEN:
+        return False
+    return any(item.lower().startswith(needle) for item in spellings if item)
 
 
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
