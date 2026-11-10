@@ -428,7 +428,7 @@ def query_sessions(
         if not include_cron and msg_count == 0 and not title:
             continue
 
-        explicit_key = str(_row_get(r, "session_key") or "").strip() or sid_to_key.get(sid, "")
+        explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
         # ``routed`` tells delivery whether a real gateway route exists. A merely synthesized
         # ``:local:dm:`` key can pass core's admissibility check and be dropped asynchronously, so a
         # dormant mount must happen before injecting.
@@ -512,21 +512,25 @@ def _root_from_key(skey: str) -> str:
 
 
 def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
-    """``parent_session_id`` for ``sid`` ("" when unknown), never raising."""
+    """Compression parent for ``sid``; branches, resets and delegated work are new turns."""
     if not sid:
         return ""
-    try:
-        colset = {c.lower() for c in _column_names(con, "sessions")}
-        if "id" not in colset or "parent_session_id" not in colset:
-            return ""
-        row = con.execute(
-            "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1", (sid,)
-        ).fetchone()
-    except sqlite3.Error:
+    colset = {c.lower() for c in _column_names(con, "sessions")}
+    if not {"id", "parent_session_id", "end_reason"} <= colset:
         return ""
-    if row is None:
+    row = con.execute(
+        f"SELECT {_projection(colset, ('parent_session_id', 'model_config', 'source'))} "
+        "FROM sessions WHERE id = ? LIMIT 1", (sid,)
+    ).fetchone()
+    if row is None or str(_row_get(row, "source") or "").strip().lower() in {"tool", "subagent"}:
         return ""
-    return str(_row_get(row, "parent_session_id") or "").strip()
+    parent_id = str(_row_get(row, "parent_session_id") or "").strip()
+    if not parent_id or _is_branch_edge(_row_get(row, "model_config"), parent_id):
+        return ""
+    parent = con.execute("SELECT end_reason FROM sessions WHERE id = ? LIMIT 1", (parent_id,)).fetchone()
+    if str(_row_get(parent, "end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
+        return ""
+    return parent_id
 
 
 def _is_branch_edge(model_config: Any, ancestor_id: str) -> bool:
@@ -553,96 +557,66 @@ def _same_title(left: str, right: str) -> bool:
 
 
 def _ancestor_descendants(
-    home: Path, needle_low: str, all_sessions: list[dict[str, Any]]
+    home: Path, needle_low: str, all_sessions: list[dict[str, Any]], *,
+    ns: str = "main", caller_session_id: str = "", caller_session_key: str = "",
 ) -> list[dict[str, Any]]:
-    """Live descendants of ``needle_low``, with branch/reset/delegate edges removed.
+    """Read the actual compression lineage, without route dedup or a recency window.
 
-    Empty when the id is not an ancestor. More than one entry means the lineage is ambiguous and
-    the caller must say so instead of guessing.
+    Only a parent ended by compression licenses a continuation edge. Reset/branch/
+    delegate markers and tool children end that path. Two live siblings stay two
+    candidates even when their routing keys are identical.
     """
-    if not needle_low or not all_sessions:
-        return []
     db_path = Path(home) / "state.db"
-    if not db_path.is_file():
+    if not needle_low or not db_path.is_file():
         return []
-
-    chain: list[str] = []
-    ancestor_key = ""
-    branched: set[str] = set()
     con: sqlite3.Connection | None = None
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
-        if "id" not in colset:
+        if not {"id", "parent_session_id", "end_reason"} <= colset:
             return []
-        has_key = "session_key" in colset
-        has_parent = "parent_session_id" in colset
-        has_config = "model_config" in colset
-        wanted = ["id"] + (["session_key"] if has_key else []) + (
-            ["parent_session_id"] if has_parent else []
-        ) + (["model_config"] if has_config else [])
-        row = con.execute(
-            f"SELECT {', '.join(wanted)} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
+        wanted = _SESSION_OPTIONAL_COLUMNS + ("model_config",)
+        select_list = "id, " + _projection(colset, wanted)
+        ancestor = con.execute(
+            f"SELECT {select_list} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
         ).fetchone()
-        if row is None:
+        if str(_row_get(ancestor, "end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
             return []
-        ancestor_id = str(_row_get(row, "id") or "")
-        if not ancestor_id:
-            return []
-        ancestor_key = str(_row_get(row, "session_key") or "").strip()
-        chain = [ancestor_id.lower()]
-        frontier = [ancestor_id]
-        for _ in range(5):
-            if not has_parent or not frontier:
-                break
-            marks = ",".join("?" for _ in frontier)
-            child_rows = con.execute(
-                f"SELECT {', '.join(wanted)} FROM sessions WHERE lower(parent_session_id) IN ({marks})",
-                [item.lower() for item in frontier],
-            ).fetchall()
+        sid_to_key, _entries = _load_routing_map(con, home)
+        frontier = [str(_row_get(ancestor, "id"))]
+        seen = {frontier[0].lower()}
+        candidates: list[dict[str, Any]] = []
+        while frontier:
             next_frontier: list[str] = []
-            for child in child_rows:
-                cid = str(_row_get(child, "id") or "")
-                if not cid or cid.lower() in chain:
-                    continue
-                parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
-                if _is_branch_edge(_row_get(child, "model_config"), parent_id):
-                    branched.add(cid.lower())
-                    continue
-                chain.append(cid.lower())
-                next_frontier.append(cid)
+            for parent in frontier:
+                for child in con.execute(
+                    f"SELECT {select_list} FROM sessions WHERE lower(parent_session_id) = ?", (parent.lower(),)
+                ):
+                    sid = str(_row_get(child, "id") or "")
+                    if not sid or sid.lower() in seen:
+                        continue
+                    seen.add(sid.lower())
+                    if len(seen) > 10000:
+                        raise StoreReadError("Compression lineage exceeds safe resolution bound")
+                    source = str(_row_get(child, "source") or "").strip().lower()
+                    if source in {"tool", "subagent"} or _is_branch_edge(_row_get(child, "model_config"), parent):
+                        continue
+                    reason = str(_row_get(child, "end_reason") or "").strip().lower()
+                    if reason in _COMPRESSED_END_REASONS:
+                        next_frontier.append(sid)
+                        continue
+                    if reason == "session_reset":
+                        continue
+                    item = _row_to_session(child, sid_to_key, ns=ns, caller_session_id=caller_session_id, caller_session_key=caller_session_key)
+                    if item is not None and item["_active"] and not item["_archived"] and not item["_cron"]:
+                        candidates.append(item)
             frontier = next_frontier
-    except sqlite3.Error:
-        return []
+        return candidates
+    except sqlite3.Error as exc:
+        raise StoreReadError(str(exc)) from exc
     finally:
         if con is not None:
             con.close()
-
-    by_sid = {s["session_id"].lower(): s for s in all_sessions}
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for cid in chain:
-        found = by_sid.get(cid)
-        if found is not None and cid not in seen:
-            candidates.append(found)
-            seen.add(cid)
-    for s in all_sessions:
-        sid_low = s["session_id"].lower()
-        if sid_low in seen:
-            continue
-        if ancestor_key and s["session_key"] == ancestor_key:
-            candidates.append(s)
-            seen.add(sid_low)
-        elif s["root_session_id"].lower() == needle_low:
-            candidates.append(s)
-            seen.add(sid_low)
-
-    candidates = [c for c in candidates if c["session_id"].lower() != needle_low]
-    candidates = [c for c in candidates if c["session_id"].lower() not in branched]
-    live = [
-        c for c in candidates if not c.get("_archived") and not c.get("_cron") and c.get("_active", True)
-    ]
-    return live or candidates
 
 
 def _resolve_ancestor_alias(
@@ -668,7 +642,7 @@ def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key)
         return None
     if str(_row_get(r, "end_reason") or "").strip().lower() in _COMPRESSED_END_REASONS:
         return None
-    explicit_key = str(_row_get(r, "session_key") or "").strip() or sid_to_key.get(sid, "")
+    explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
     routed = bool(explicit_key)
     skey = explicit_key or (f"agent:{ns}:local:dm:{sid}" if sid.startswith("local-") else "")
     root_sid = skey.rsplit(":", 1)[-1] if skey and ":local:dm:local-" in skey else sid
@@ -815,7 +789,10 @@ def _scan_title_and_prefix(
                 row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
                 caller_session_key=caller_session_key,
             )
-            if built is None:
+            if built is None or built.get("_end_reason") == "session_reset":
+                # A reset predecessor's key now belongs to a different conversation.
+                # Refusing its exact ID is not enough: its old title/prefix must not
+                # silently address that new conversation either.
                 continue
             sid = built["session_id"]
             if want_prefix and (
@@ -871,6 +848,15 @@ def resolve_target(
             return None, []
         return direct, []
 
+    # Resolve physical compression edges before route-key dedup can hide live siblings.
+    descendants = _ancestor_descendants(home, needle_low, [], ns=ns,
+                                        caller_session_id=caller_session_id,
+                                        caller_session_key=caller_session_key)
+    if len(descendants) == 1:
+        return descendants[0], []
+    if len(descendants) > 1:
+        return None, descendants[:8]
+
     # Rank over a much wider window than the public session_list cap so the compression
     # alias can still see the live continuation. Prefix and title resolution do not use
     # this window: a second match past it would otherwise look unique.
@@ -902,14 +888,7 @@ def resolve_target(
             return active_exact[0], []
         return None, (active_exact or exact_id)[:8]
 
-    # Tier 1b - an ended/compressed segment id resolves to its live continuation. Several live
-    # descendants and no lineage to separate them is ambiguity, not a miss (S01).
-    alias = _resolve_ancestor_alias(home, needle_low, all_sessions)
-    if alias is not None:
-        return alias, []
-    descendants = _ancestor_descendants(home, needle_low, all_sessions)
-    if len(descendants) > 1:
-        return None, descendants[:8]
+
 
     prefix_hits, title_hits = _scan_title_and_prefix(
         home, needle, needle_low, ns=ns, caller_session_id=caller_session_id,
@@ -1078,7 +1057,7 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
     ``(-1, 0)`` means the store could not be read, which is not an untagged turn.
 
     Right after context compression the caller's ``session_id`` is a fresh continuation segment
-    with no messages yet, so up to five ``parent_session_id`` hops are checked.
+    with no messages yet, so its verified compression lineage is checked (bounded at 10000 rows).
     """
     sid = str(session_id or "").strip()
     if not sid:
@@ -1096,9 +1075,9 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
         order_col = "id" if "id" in msg_cols else ("timestamp" if "timestamp" in msg_cols else "rowid")
         current = sid
         seen: set[str] = set()
-        for _ in range(6):  # this segment, then up to five parent segments
-            if not current or current in seen:
-                break
+        while current and current not in seen:
+            if len(seen) >= 10000:
+                return -1, 0  # bounded uncertainty must not reset the loop guard
             seen.add(current)
             where = "session_id = ?" + (" AND role = 'user'" if has_role else "")
             # A pure compression summary is not a turn, so it must not hide the parent's card
@@ -1108,6 +1087,13 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
                 where += (
                     " AND (COALESCE(_compressed_summary, 0) = 0"
                     " OR COALESCE(_compressed_summary_has_user_turn, 0) != 0)"
+                )
+            elif "_compressed_summary" in msg_cols and "display_kind" in msg_cols:
+                # Current Hermes persists no *_has_user_turn column. Pure summary
+                # rows are hidden; a carrier preserving a human ask stays visible.
+                where += (
+                    " AND NOT (COALESCE(_compressed_summary, 0) != 0"
+                    " AND COALESCE(display_kind, '') = 'hidden')"
                 )
             row = con.execute(
                 f"SELECT content FROM messages WHERE {where} ORDER BY {order_col} DESC LIMIT 1",

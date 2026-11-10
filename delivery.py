@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -30,9 +31,9 @@ _TURN_HOP: dict[tuple[str, str], tuple[int, int, float]] = {}
 
 _MESSAGE_MAX_CHARS = 32 * 1024
 
-# One operation, keyed by request_id, so a retry replays the first outcome instead of delivering
+# One operation, keyed by (profile home, request_id), so a retry replays the first outcome instead of delivering
 # again. ``payload_hash`` is the body as accepted; a different body under the same id conflicts.
-_OPERATIONS: dict[str, dict[str, Any]] = {}
+_OPERATIONS: dict[tuple[str, str], dict[str, Any]] = {}
 _OPERATION_MAX = 4096
 
 # One bucket per target. A long-lived process that talks to a new target every time must not
@@ -51,12 +52,16 @@ _SEND_BUCKET_MIN_HORIZON = 600.0
 _DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hermes-intercom-discover")
 # Per-bucket retention. A caller with a short window must not evict another target's longer one.
 _BUCKET_HORIZON: dict[tuple[str, str], float] = {}
-# Gateway receipt status keyed by request_id. The submit tuple stays (ok, admission_id).
-_RECEIPT_STATUS: dict[str, str] = {}
+# Gateway receipt status keyed by (profile home, request_id). The submit tuple stays (ok, admission_id).
+_RECEIPT_STATUS: dict[tuple[str, str], str] = {}
 # status says where the receipt is. outcome says how it ended. reference is the host's id for it.
 # Keeping only status makes completed and cancelled look the same (R4-STATIC).
-_RECEIPT_OUTCOME: dict[str, str] = {}
-_RECEIPT_REFERENCE: dict[str, str] = {}
+_RECEIPT_OUTCOME: dict[tuple[str, str], str] = {}
+_RECEIPT_REFERENCE: dict[tuple[str, str], str | dict[str, str]] = {}
+
+
+def _operation_key(home: Path, request_id: str) -> tuple[str, str]:
+    return os.path.normcase(str(Path(home).resolve())), request_id
 
 
 def shutdown_discovery_executor() -> None:
@@ -102,7 +107,7 @@ def _pos_int(val: Any, default: int, *, minimum: int = 0, maximum: int = 10000) 
     except (TypeError, ValueError, OverflowError):
         return default
     if parsed < minimum:
-        return default
+        return minimum
     return min(parsed, maximum)
 
 
@@ -116,7 +121,7 @@ def _pos_float(val: Any, default: float, *, minimum: float = 0.5, maximum: float
     if not math.isfinite(parsed):
         return default
     if parsed < minimum:
-        return default
+        return minimum
     return min(parsed, maximum)
 
 
@@ -199,8 +204,16 @@ def _is_gateway_injection_allowed(ctx: Any, home: Path) -> bool:
     if not cfg_path.is_file():
         return False
     try:
-        import yaml
-        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
+        document = cfg_path.read_text(encoding="utf-8-sig")
+        try:
+            from ruamel.yaml import YAML
+        except ImportError:
+            import yaml
+            cfg = yaml.safe_load(document) or {}
+        else:
+            parser = YAML(typ="safe", pure=True)
+            parser.version = (1, 1)  # match Hermes config booleans on both host generations
+            cfg = parser.load(document) or {}
         entries = ((cfg.get("plugins") or {}).get("entries") or {}) if isinstance(cfg, dict) else {}
         entry = entries.get(plugin_id) if isinstance(entries, dict) else None
         return isinstance(entry, dict) and entry.get("allow_gateway_injection") is True
@@ -484,13 +497,17 @@ def submit_via_gateway_ws(
                             # A terminal or unknown receipt must not read as a fresh admission (F19).
                             status = str(receipt.get("status") or "admitted")
                             if request_id and status:
-                                _RECEIPT_STATUS[request_id] = status
+                                _RECEIPT_STATUS[_operation_key(home, request_id)] = status
                             outcome = str(receipt.get("outcome") or "")
-                            reference = str(receipt.get("ref") or receipt.get("reference") or "")
-                            if request_id and outcome:
-                                _RECEIPT_OUTCOME[request_id] = outcome
-                            if request_id and reference:
-                                _RECEIPT_REFERENCE[request_id] = reference
+                            raw_reference = receipt.get("ref") or receipt.get("reference") or ""
+                            if isinstance(raw_reference, dict):
+                                reference = {key: value for key in ("profile_id", "session_id")
+                                             if isinstance((value := raw_reference.get(key)), str)}
+                            else:
+                                reference = str(raw_reference)
+                            if request_id:
+                                _RECEIPT_OUTCOME[_operation_key(home, request_id)] = outcome
+                                _RECEIPT_REFERENCE[_operation_key(home, request_id)] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -643,12 +660,11 @@ def on_pre_llm_call(session_id: str = "", user_message: Any = None, *, ctx: Any 
     now_mono = time.monotonic()
     with _LOCK:
         _evict_stale_turn_hops(now_mono)
-        if hop > 0:
-            _remember_turn_hop(key, hop, sender_max_hops, now_mono)
-            if home_key:
-                _TURN_HOP.pop(("", sid), None)
-        else:
-            _TURN_HOP.pop(key, None)
+        # Zero is observed current human input, not a cache miss. Retaining it
+        # prevents an older unflushed DB row from reviving an exhausted budget.
+        _remember_turn_hop(key, hop, sender_max_hops, now_mono)
+        if home_key:
+            _TURN_HOP.pop(("", sid), None)
     return None
 
 
@@ -910,7 +926,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     mem_hop, sender_max_hops = _hop_parts(entry)
     # The in-memory pair dies with the process. The stored card still carries both numbers,
     # so a restart must not silently raise a budget the sender already lowered.
-    db_hop, db_max_hops = store.latest_user_message_tag(home, caller_sid) if caller_sid else (0, 0)
+    db_hop, db_max_hops = (
+        store.latest_user_message_tag(home, caller_sid) if caller_sid and entry is None else (0, 0)
+    )
     if db_hop < 0:
         return _json({
             "ok": False,
@@ -944,14 +962,17 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # A caller-supplied id is the gateway admission key (principal + session + request_id), so a
     # retry of an ambiguous result reuses it instead of minting a second message. A new send still
     # gets its own id. The host refuses anything empty or longer than 1024 characters.
-    supplied_request = _sanitize_utf8(raw_request or "").strip()
-    if supplied_request and (len(supplied_request) > 1024 or any(ch.isspace() for ch in supplied_request)):
+    supplied_request = raw_request or ""
+    if supplied_request and (len(supplied_request) > 1024
+                             or any(ch.isspace() or ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+                                    for ch in supplied_request)):
         return _json({
             "ok": False,
             "error": "invalid_request_id",
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
     send_token = supplied_request or uuid.uuid4().hex
+    operation_key = _operation_key(home, send_token)
     identity = "\n".join((
         str(resolved["session_id"]), target_key, caller_sid, str(bool(expect_reply)), message_body,
     ))
@@ -964,7 +985,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     keep_win = max(burst_win, dedup_win)
 
     with _LOCK:
-        prior = _OPERATIONS.get(send_token)
+        prior = _OPERATIONS.get(operation_key)
         if prior is not None and prior.get("payload_hash") != payload_hash:
             return _json({
                 "ok": False,
@@ -972,6 +993,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 "request_id": send_token,
                 "message": "request_id was already used with a different message.",
             })
+        if prior is not None and prior.get("busy"):
+            return _json({"ok": False, "error": "request_in_flight", "request_id": send_token,
+                          "message": "This operation is still being delivered. Retry after it finishes."})
         if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
             return _json({**prior["result"], "replayed": True})
         # A gateway attempt stays a gateway attempt. That covers a confirmed submit and one
@@ -989,9 +1013,19 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
         if prior is None:
-            # Claimed before delivery so a second caller with the same id waits on this one
-            # instead of delivering beside it. A gateway retry keeps the record it already has.
-            _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
+            # Bound *admission*, not only successful completions. Unknown or active
+            # operations must never be forgotten: the peer may already have the message.
+            while len(_OPERATIONS) >= _OPERATION_MAX:
+                evicted = next((key for key, op in _OPERATIONS.items()
+                                if op.get("delivered") and not op.get("busy")), None)
+                if evicted is None:
+                    return _json({"ok": False, "error": "operation_capacity", "request_id": send_token,
+                                  "message": "Delivery memory is full of unresolved operations. Reconcile existing request_ids first."})
+                _OPERATIONS.pop(evicted, None)
+                _RECEIPT_STATUS.pop(evicted, None)
+                _RECEIPT_OUTCOME.pop(evicted, None)
+                _RECEIPT_REFERENCE.pop(evicted, None)
+            _OPERATIONS[operation_key] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
         _remember_bucket_horizon(bucket_key, keep_win)
         _evict_stale_send_buckets(now_mono)
         history, retained = _recent_sends_for(bucket_key, now_mono, keep_win)
@@ -1000,7 +1034,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             for ts, sender, d, tok in history
         ):
             if prior is None:
-                _OPERATIONS.pop(send_token, None)
+                _OPERATIONS.pop(operation_key, None)
             return _json(
                 {
                     "ok": False,
@@ -1015,7 +1049,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         }
         if send_token not in seen_tokens and len(seen_tokens) >= max_per_win:
             if prior is None:
-                _OPERATIONS.pop(send_token, None)
+                _OPERATIONS.pop(operation_key, None)
             return _json(
                 {
                     "ok": False,
@@ -1026,6 +1060,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         if not any(tok == send_token for _ts, _sender, _d, tok in retained):
             retained.append((now_mono, caller_sid, digest, send_token))
         _RECENT_SENDS[bucket_key] = retained
+        _OPERATIONS[operation_key]["busy"] = True
         while len(_RECENT_SENDS) > _RECENT_SENDS_MAX_BUCKETS:
             oldest = min(
                 _RECENT_SENDS, key=lambda key: _RECENT_SENDS[key][-1][0] if _RECENT_SENDS[key] else 0.0
@@ -1057,7 +1092,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # A retry resubmits the first attempt's bytes. Rebuilding the card after a rename or a
     # retitle makes the same request_id look like a different operation to the host (R4-D03).
     with _LOCK:
-        frozen = _OPERATIONS.get(send_token) or {}
+        frozen = _OPERATIONS.get(operation_key) or {}
         if frozen.get("delivery_method") == "gateway_ws" and frozen.get("envelope"):
             payload = frozen["envelope"]
 
@@ -1066,7 +1101,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     mount_timeout = float(cfg["mount_timeout_seconds"])
 
     def _budget() -> float:
-        return max(0.2, min(mount_timeout, overall_deadline - time.monotonic()))
+        return max(0.0, min(mount_timeout, overall_deadline - time.monotonic()))
 
     mount_sid = resolved.get("root_session_id") or resolved["session_id"]
     dormant_local = ":local:dm:" in target_key
@@ -1078,13 +1113,53 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     if routed and dormant_local:
         db_path = Path(home) / "state.db"
         if db_path.is_file():
-            con = store._connect_ro(db_path)
             try:
-                has_index = bool(store._column_names(con, "gateway_routing"))
-                sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
-            finally:
-                con.close()
-            if has_index and (sid_to_key or key_to_entry):
+                con = store._connect_ro(db_path)
+                try:
+                    has_index = bool(store._column_names(con, "gateway_routing"))
+                    sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
+                    route_entry = key_to_entry.get(target_key, {})
+                    owner = str(route_entry.get("session_id") or "")
+                    lineage = {resolved["session_id"]}
+                    cursor = resolved["session_id"]
+                    while owner and owner not in lineage and len(lineage) < 10000:
+                        cursor = store._parent_session_id(con, cursor)
+                        if not cursor or cursor in lineage:
+                            break
+                        lineage.add(cursor)
+                    if owner and owner not in lineage:
+                        with _LOCK:
+                            if prior is not None:
+                                _OPERATIONS[operation_key]["busy"] = False
+                            else:
+                                _OPERATIONS.pop(operation_key, None)
+                                rows = [row for row in _RECENT_SENDS.get(bucket_key, []) if row[3] != send_token]
+                                if rows:
+                                    _RECENT_SENDS[bucket_key] = rows
+                                else:
+                                    _RECENT_SENDS.pop(bucket_key, None)
+                                    _BUCKET_HORIZON.pop(bucket_key, None)
+                        return _json({"ok": False, "error": "target_route_changed", "request_id": send_token,
+                                      "message": "The route belongs to a different conversation; this attempt sent nothing."})
+                finally:
+                    con.close()
+            except sqlite3.Error:
+                # A new operation has sent nothing; a gateway retry may already
+                # be queued remotely, so preserve its identity and first envelope.
+                with _LOCK:
+                    if prior is not None:
+                        _OPERATIONS[operation_key]["busy"] = False
+                    else:
+                        _OPERATIONS.pop(operation_key, None)
+                        rows = [row for row in _RECENT_SENDS.get(bucket_key, []) if row[3] != send_token]
+                        if rows:
+                            _RECENT_SENDS[bucket_key] = rows
+                        else:
+                            _RECENT_SENDS.pop(bucket_key, None)
+                            _BUCKET_HORIZON.pop(bucket_key, None)
+                return _json({"ok": False, "error": "store_unreadable", "request_id": send_token,
+                              "message": "Routing could not be read; this attempt sent nothing. An earlier gateway attempt may still be admitted."})
+            if has_index:
                 route_key = resolved.get("session_key") or ""
                 if route_key not in key_to_entry and resolved["session_id"] not in sid_to_key:
                     routed = False
@@ -1094,7 +1169,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # Mount writes the target back into the gateway. That is the same grant as injection (F05).
     gateway_granted = _is_gateway_injection_allowed(ctx, home)
 
-    if not routed and dormant_local and cfg["auto_mount_dormant"] and gateway_granted:
+    if not routed and dormant_local and cfg["auto_mount_dormant"] and gateway_granted and _budget() > 0:
         # Unrouted :local:dm: keys are a false positive for core: inject_message returns True
         # synchronously and then drops the payload, so mount before injecting (W202).
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
@@ -1111,7 +1186,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     if (
         not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"]
-        and dormant_local and gateway_granted
+        and dormant_local and gateway_granted and _budget() > 0
     ):
         # Routed but not mounted in authority.sessions right now: core returns False synchronously.
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
@@ -1121,7 +1196,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     ws_err = ""
     admission_id = ""
-    if not accepted and gateway_granted and dormant_local:
+    if not accepted and gateway_granted and dormant_local and _budget() <= 0:
+        ws_err = "pre_submit:deadline_exhausted"
+    elif not accepted and gateway_granted and dormant_local:
         ws_ok, ws_err = submit_via_gateway_ws(
             home, mount_sid, payload, timeout=_budget(), request_id=send_token
         )
@@ -1146,20 +1223,24 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     _RECENT_SENDS[bucket_key] = remaining
                 else:
                     _RECENT_SENDS.pop(bucket_key, None)
+                    _BUCKET_HORIZON.pop(bucket_key, None)
                 # A confirmed or unconfirmed gateway attempt keeps its transport. A later retry
                 # must go back to the gateway, not through inject_message (R4-D01).
-                kept = _OPERATIONS.get(send_token)
+                kept = _OPERATIONS.get(operation_key)
                 if not (kept and kept.get("delivery_method") == "gateway_ws"):
-                    _OPERATIONS.pop(send_token, None)
+                    _OPERATIONS.pop(operation_key, None)
+                else:
+                    kept["busy"] = False
         else:
             # The receipt is gone but the submit may have landed. Remember the transport and
             # drop the in-flight bit, so the retry the message asks for is not request_in_flight
             # and does not switch to inject_message (R3-02, R4-D01).
             with _LOCK:
-                prior_op = _OPERATIONS.get(send_token) or {}
-                _OPERATIONS[send_token] = {
+                prior_op = _OPERATIONS.get(operation_key) or {}
+                _OPERATIONS[operation_key] = {
                     "payload_hash": prior_op.get("payload_hash", payload_hash),
                     "delivered": False,
+                    "busy": False,
                     "delivery_method": "gateway_ws",
                     "envelope": payload,
                     "result": {},
@@ -1207,7 +1288,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     result = {
         "ok": True,
-        "status": _RECEIPT_STATUS.get(send_token) or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
+        "status": _RECEIPT_STATUS.get(operation_key) or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
         "delivery_method": delivery_method,
         "from_session_id": sender_info["session_id"],
         "target_session_id": resolved["session_id"],
@@ -1219,9 +1300,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         "mounted_dormant": mounted_dormant,
         "request_id": send_token,
         "admission_id": admission_id,
-        "admission_status": _RECEIPT_STATUS.get(send_token, ""),
-        "outcome": _RECEIPT_OUTCOME.get(send_token, ""),
-        "reference": _RECEIPT_REFERENCE.get(send_token, ""),
+        "admission_status": _RECEIPT_STATUS.get(operation_key, ""),
+        "outcome": _RECEIPT_OUTCOME.get(operation_key, ""),
+        "reference": _RECEIPT_REFERENCE.get(operation_key, ""),
         "note": (
             "The gateway accepted this prompt into the target session."
             if delivery_method == "gateway_ws" else
@@ -1230,17 +1311,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         ),
     }
     with _LOCK:
-        if len(_OPERATIONS) >= _OPERATION_MAX:
-            evicted = next(iter(_OPERATIONS))
-            _OPERATIONS.pop(evicted, None)
-            # The receipt belongs to the operation. Leaving it lets a later reuse of the same
-            # request_id read the previous outcome (R4-STATIC).
-            _RECEIPT_STATUS.pop(evicted, None)
-            _RECEIPT_OUTCOME.pop(evicted, None)
-            _RECEIPT_REFERENCE.pop(evicted, None)
-        _OPERATIONS[send_token] = {
+        _OPERATIONS[operation_key] = {
             "payload_hash": payload_hash,
             "delivered": True,
+            "busy": False,
             "delivery_method": delivery_method,
             "envelope": payload,
             "result": result,

@@ -8,12 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 import time
-import types
 from pathlib import Path
-
-import pytest
 
 import importlib.util
 
@@ -43,6 +39,9 @@ def _insert(home: Path, rows: list[tuple]) -> None:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             row,
         )
+        if row[10]:
+            con.execute("INSERT OR REPLACE INTO gateway_routing(session_key, entry_json) VALUES (?, ?)",
+                        (row[10], json.dumps({"session_id": row[0]})))
     con.commit()
     con.close()
 
@@ -493,7 +492,7 @@ def test_f19_terminal_receipt_is_not_reported_as_admitted(tmp_path: Path, monkey
     plugin = _load_plugin()
 
     def _terminal(*_a, **kwargs):
-        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_STATUS[plugin.delivery._operation_key(home, kwargs["request_id"])] = "terminal"
         return True, "adm-9"
 
     monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _terminal)
@@ -983,9 +982,10 @@ def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> 
     plugin = _load_plugin()
 
     def _ws(*_args, **_kwargs):
-        plugin.delivery._RECEIPT_STATUS["receipt-1"] = "terminal"
-        plugin.delivery._RECEIPT_OUTCOME["receipt-1"] = "cancelled"
-        plugin.delivery._RECEIPT_REFERENCE["receipt-1"] = "ref-9"
+        key = plugin.delivery._operation_key(home, "receipt-1")
+        plugin.delivery._RECEIPT_STATUS[key] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[key] = "cancelled"
+        plugin.delivery._RECEIPT_REFERENCE[key] = "ref-9"
         return True, "adm-1"
 
     monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
@@ -998,9 +998,8 @@ def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> 
 def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatch) -> None:
     """R4-STATIC: a receipt lives only as long as its operation.
 
-    The maps are filled by the real submit path, through a fake gateway client, not by the
-    test writing them. A later send that pushes the operation cap past this one must take
-    the receipt with it. A retry of the evicted id must not read the old outcome.
+    The fake submit writes receipt maps directly: this qualifies cache lifecycle,
+    not the transport. The fifth operation must evict the oldest of four slots.
     """
     home, ctx = _routed_pair(tmp_path)
     ctx.allow_gateway_injection = True
@@ -1008,10 +1007,10 @@ def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatc
     plugin = _load_plugin()
 
     def _ws(*_args, **kwargs):
-        token = kwargs["request_id"]
-        plugin.delivery._RECEIPT_STATUS[token] = "terminal"
-        plugin.delivery._RECEIPT_OUTCOME[token] = "cancelled"
-        plugin.delivery._RECEIPT_REFERENCE[token] = "ref-9"
+        key = plugin.delivery._operation_key(home, kwargs["request_id"])
+        plugin.delivery._RECEIPT_STATUS[key] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[key] = "cancelled"
+        plugin.delivery._RECEIPT_REFERENCE[key] = "ref-9"
         return True, "adm-1"
 
     monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
@@ -1032,21 +1031,24 @@ def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatc
 
     third = _send_here("hello once more", "receipt-third")
     assert third["ok"] is True
-    assert "receipt-old" in plugin.delivery._RECEIPT_OUTCOME
+    assert plugin.delivery._operation_key(home, "receipt-old") in plugin.delivery._RECEIPT_OUTCOME
 
-    fourth = _send_here("and once past the cap", "receipt-fourth")
+    fourth = _send_here("at capacity", "receipt-fourth")
     assert fourth["ok"] is True
-    assert "receipt-old" not in plugin.delivery._RECEIPT_STATUS
-    assert "receipt-old" not in plugin.delivery._RECEIPT_OUTCOME
-    assert "receipt-old" not in plugin.delivery._RECEIPT_REFERENCE
-    assert "receipt-fourth" in plugin.delivery._RECEIPT_OUTCOME
+    assert plugin.delivery._operation_key(home, "receipt-old") in plugin.delivery._RECEIPT_STATUS
+    fifth = _send_here("and once past the cap", "receipt-fifth")
+    assert fifth["ok"] is True
+    assert plugin.delivery._operation_key(home, "receipt-old") not in plugin.delivery._RECEIPT_STATUS
+    assert plugin.delivery._operation_key(home, "receipt-old") not in plugin.delivery._RECEIPT_OUTCOME
+    assert plugin.delivery._operation_key(home, "receipt-old") not in plugin.delivery._RECEIPT_REFERENCE
+    assert plugin.delivery._operation_key(home, "receipt-fourth") in plugin.delivery._RECEIPT_OUTCOME
 
 
 def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_path: Path, monkeypatch) -> None:
     """R4-D05: a metadata key is unverified when the routing index names other sessions and not this one.
 
-    An empty gateway_routing table keeps the old path. The suite's local sessions have one and
-    it is empty. A table that names a different session makes this target mount first.
+    A real matching routing row keeps the injector path. Removing only that row
+    makes the target mount first; another session's route cannot vouch for it.
     """
     plugin = _load_plugin()
     mounts: list[str] = []
@@ -1061,6 +1063,7 @@ def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_pat
     assert mounts == [] and bare["ok"] is True
 
     con = sqlite3.connect(str(home / "state.db"))
+    con.execute("DELETE FROM gateway_routing WHERE session_key = ?", ("agent:main:local:dm:local-target-0001",))
     con.execute(
         "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
         ("agent:main:local:dm:someone-else", '{"session_id": "local-other"}'),

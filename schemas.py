@@ -82,7 +82,7 @@ SESSION_SEND_SCHEMA: dict = {
             "request_id": {
                 "type": "string",
                 "description": (
-                    "Optional retry identity, 1-1024 characters. Pass the request_id from an earlier "
+                    "Optional retry identity, 1-1024 characters without whitespace, controls or UTF-16 surrogates. Pass the request_id from an earlier "
                     "result to retry that same operation: an identical inject retry returns the first outcome "
                     "without delivering again, and a different message under the same id is refused. "
                     "A gateway submit is deduplicated by the gateway, not replayed here. "

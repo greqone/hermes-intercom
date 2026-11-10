@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import sqlite3
 import sys
@@ -283,6 +282,9 @@ def _seed_two_sessions(db_path: Path) -> tuple[str, str]:
             ),
         ],
     )
+    for sid in (sid_a, sid_b):
+        con.execute("INSERT OR REPLACE INTO gateway_routing(session_key, entry_json) VALUES (?, ?)",
+                    (f"agent:main:local:dm:{sid}", json.dumps({"session_id": sid})))
     con.commit()
     con.close()
     return sid_a, sid_b
@@ -576,7 +578,7 @@ def test_resilient_per_key_settings_and_rate_limiting(
             if key == "max_messages_per_window":
                 return 2
             if key == "burst_window_seconds":
-                return -50  # invalid negative -> must fall back to default 600
+                return -50  # below minimum -> clamp to 1, do not widen the setting
             return super().get_config(key, default)
 
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -588,7 +590,7 @@ def test_resilient_per_key_settings_and_rate_limiting(
     assert cfg["max_hops"] == 3
     assert cfg["dedup_window_seconds"] == 0
     assert cfg["max_messages_per_window"] == 2
-    assert cfg["burst_window_seconds"] == 600
+    assert cfg["burst_window_seconds"] == 1
 
     r1 = json.loads(send_fn({"target": sid_b, "message": "msg 1"}, session_id=sid_a))
     r2 = json.loads(send_fn({"target": sid_b, "message": "msg 2"}, session_id=sid_a))
@@ -1072,6 +1074,9 @@ def _insert_session(db_path: Path, **fields: Any) -> str:
             row["last_activity_at"],
         ),
     )
+    if row["session_key"]:
+        con.execute("INSERT OR REPLACE INTO gateway_routing(session_key, entry_json) VALUES (?, ?)",
+                    (row["session_key"], json.dumps({"session_id": row["id"]})))
     con.commit()
     con.close()
     return str(row["id"])
@@ -1364,6 +1369,8 @@ def test_exact_session_id_resolves_beyond_the_recency_window(
         (ancient, "local", "m", None, 1, None, None, 2, "/w", "Ancient", 0, 0,
          f"agent:main:local:dm:{ancient}", 1.0),
     )
+    con.execute("INSERT INTO gateway_routing(session_key, entry_json) VALUES (?, ?)",
+                (f"agent:main:local:dm:{ancient}", json.dumps({"session_id": ancient})))
     con.executemany(
         "INSERT INTO sessions (id, source, title, message_count, last_activity_at, session_key)"
         " VALUES (?,?,?,?,?,?)",

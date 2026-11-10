@@ -125,6 +125,9 @@ def _seed_disposable_home(home: Path, *, allow_injection: bool) -> tuple[str, st
             ),
         ],
     )
+    for sid in (sid_a, sid_b):
+        con.execute("INSERT INTO gateway_routing(session_key, entry_json) VALUES (?, ?)",
+                    (f"agent:main:local:dm:{sid}", json.dumps({"session_id": sid})))
     con.commit()
     con.close()
     return sid_a, sid_b
