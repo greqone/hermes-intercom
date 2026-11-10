@@ -162,18 +162,29 @@ def test_r6_a_a_receipt_does_not_cross_two_homes(tmp_path, monkeypatch) -> None:
         ctx._allow_inject = False
         ctx.allow_gateway_injection = True
     plugin = _load_plugin()
-    homes = {"a": str(home_a), "b": str(home_b)}
 
-    def _receipt(*_a, **kwargs):
-        home = str(kwargs.get("home") or _a[0])
-        status = "started" if home == homes["a"] else "terminal"
-        key = (home, kwargs["request_id"])
-        plugin.delivery._RECEIPT_STATUS[key] = status
-        plugin.delivery._RECEIPT_OUTCOME[key] = ""
-        plugin.delivery._RECEIPT_REFERENCE[key] = "ref-" + status
-        return True, "adm-1"
+    class _Client:
+        def __init__(self, home):
+            self.home = str(home)
 
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _receipt)
+        async def rpc(self, method, **kwargs):
+            if method == "session.resume":
+                return {"session_id": kwargs["session_id"], "subscription_id": "sub-1"}
+            status = "started" if self.home == str(home_a) else "terminal"
+            return {"admission_id": "adm-1", "status": status, "reference": "ref-" + status}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    def _connect(**_kwargs):
+        return _Client(_kwargs.get("endpoint"))
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", lambda parts, attr: (
+        (lambda home, timeout: type("D", (), {"endpoint": str(home), "state": "ready"})()) if attr == "discover_gateway_endpoint" else _connect
+    ))
     first = _send(ctx_a, target="local-target-0001", message="hello", request_id="cross-home")
     assert first["ok"] is True and first.get("status") == "started", first
     second = _send(ctx_b, target="local-target-0001", message="hello", request_id="cross-home")
