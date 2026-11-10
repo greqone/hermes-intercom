@@ -426,3 +426,17 @@ def test_r5_s01_a_reset_rows_title_is_not_a_target(tmp_path) -> None:
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "Historical topic", caller_session_id="local-caller-0001")
     assert resolved is None and ambiguous == []
+
+
+def test_r5_s01_a_reset_stops_the_compression_line(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, "session_reset", 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []

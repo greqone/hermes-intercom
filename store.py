@@ -589,8 +589,12 @@ def _ancestor_descendants(
         wanted = ["id"] + (["session_key"] if has_key else []) + (
             ["parent_session_id"] if has_parent else []
         ) + (["model_config"] if has_config else [])
+        if has_parent and "end_reason" in colset:
+            wanted.append(
+                "(SELECT s2.end_reason FROM sessions s2 WHERE s2.id = s.parent_session_id) AS parent_end_reason"
+            )
         row = con.execute(
-            f"SELECT {', '.join(wanted)} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
+            f"SELECT {', '.join(wanted)} FROM sessions s WHERE lower(s.id) = ? LIMIT 1", (needle_low,),
         ).fetchone()
         if row is None:
             return []
@@ -605,7 +609,7 @@ def _ancestor_descendants(
                 break
             marks = ",".join("?" for _ in frontier)
             child_rows = con.execute(
-                f"SELECT {', '.join(wanted)} FROM sessions WHERE lower(parent_session_id) IN ({marks})",
+                f"SELECT {', '.join(wanted)} FROM sessions s WHERE lower(s.parent_session_id) IN ({marks})",
                 [item.lower() for item in frontier],
             ).fetchall()
             next_frontier: list[str] = []
@@ -614,7 +618,8 @@ def _ancestor_descendants(
                 if not cid or cid.lower() in chain:
                     continue
                 parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
-                if _is_branch_edge(_row_get(child, "model_config"), parent_id):
+                parent_reason = str(_row_get(child, "parent_end_reason") or "").strip().lower()
+                if _is_branch_edge(_row_get(child, "model_config"), parent_id) or parent_reason in _RESET_END_REASONS:
                     branched.add(cid.lower())
                     continue
                 chain.append(cid.lower())
@@ -634,16 +639,6 @@ def _ancestor_descendants(
         if found is not None and cid not in seen:
             candidates.append(found)
             seen.add(cid)
-    for s in all_sessions:
-        sid_low = s["session_id"].lower()
-        if sid_low in seen:
-            continue
-        if ancestor_key and s["session_key"] == ancestor_key:
-            candidates.append(s)
-            seen.add(sid_low)
-        elif s["root_session_id"].lower() == needle_low:
-            candidates.append(s)
-            seen.add(sid_low)
 
     candidates = [c for c in candidates if c["session_id"].lower() != needle_low]
     candidates = [c for c in candidates if c["session_id"].lower() not in branched]
