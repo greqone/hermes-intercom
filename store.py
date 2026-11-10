@@ -827,9 +827,7 @@ def _scan_title_and_prefix(
             if built is None:
                 continue
             sid = built["session_id"]
-            if want_prefix and (
-                sid.lower().startswith(needle_low) or built["root_session_id"].lower().startswith(needle_low)
-            ) and sid not in seen_prefix:
+            if want_prefix and sid.lower().startswith(needle_low) and sid not in seen_prefix:
                 prefix_hits.append(built)
                 seen_prefix.add(sid)
             title = built["title"]

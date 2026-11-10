@@ -490,3 +490,17 @@ def test_r5_s01_a_reset_stops_the_compression_line(tmp_path) -> None:
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
     assert resolved is None and ambiguous == []
+
+
+def test_r5_s01_a_reset_rows_prefix_does_not_reach_its_successor(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-oldroot"
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-oldroot", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("local-newlive", "local", "m", None, 3.0, None, None, 1, "New", 0, key, 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-oldro", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []

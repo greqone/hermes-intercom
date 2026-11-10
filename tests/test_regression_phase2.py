@@ -236,12 +236,12 @@ def test_s03_unc_uri_keeps_the_server_share(tmp_path: Path) -> None:
 
 # --- S04 -------------------------------------------------------------------
 
-def test_s04_root_session_prefix_matches(tmp_path: Path) -> None:
+def test_s04_a_rows_own_id_prefix_matches(tmp_path: Path) -> None:
     home = _home(tmp_path)
     _insert(home, [("local-child-9999", "local", "m", None, 1.0, None, None, 1, "Child", 0,
                     "agent:main:local:dm:local-rootabcdef", 5.0)])
     plugin = _load_plugin()
-    resolved, ambiguous = plugin.store.resolve_target(home, "local-rootabc")
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-child-9")
     assert ambiguous == []
     assert resolved["session_id"] == "local-child-9999"
 
@@ -951,11 +951,11 @@ def test_r4_send_to_the_callers_own_reset_predecessor_is_refused(tmp_path: Path,
     assert other["ok"] is True and len(ctx.injected) == 1
 
 
-def test_r4_reset_prefix_resolves_to_the_live_child(tmp_path: Path) -> None:
-    """S-R03: the ended reset row and the live child that keeps its route are one conversation.
+def test_r4_reset_prefix_does_not_reach_the_successor(tmp_path: Path) -> None:
+    """A prefix of a reset row's id must not land on the live child that kept its key.
 
-    The prefix matches the ended row's own id and the child's route key. The live child wins.
-    Two live rows that really share the prefix stay ambiguous.
+    The exact id is already refused. Matching the prefix against the shared key handed the
+    same conversation to the successor, which is the S-R01 leak through the prefix tier.
     """
     home = _home(tmp_path)
     key = "agent:main:local:dm:local-rootabcdef"
@@ -969,14 +969,7 @@ def test_r4_reset_prefix_resolves_to_the_live_child(tmp_path: Path) -> None:
     resolved, ambiguous = plugin.store.resolve_target(
         home, "local-rootabc", caller_session_id="local-caller-0001"
     )
-    assert ambiguous == []
-    assert resolved is not None and resolved["session_id"] == "local-child-9999"
-    _insert(home, [
-        ("local-rootabcxyz", "local", "m", None, 1.0, None, None, 1, "Second", 0,
-         "agent:main:local:dm:local-rootabcxyz", 6.0),
-    ])
-    _again, two = plugin.store.resolve_target(home, "local-rootabc", caller_session_id="local-caller-0001")
-    assert {item["session_id"] for item in two} == {"local-child-9999", "local-rootabcxyz"}
+    assert resolved is None and ambiguous == []
 
 
 def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> None:
