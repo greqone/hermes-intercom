@@ -319,3 +319,16 @@ def test_r5_s02_an_inactive_row_cannot_hide_the_active_card(tmp_path) -> None:
 
     plugin = _load_plugin()
     assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (0, 0)
+
+
+def test_r5_a_compressed_ancestor_does_not_resolve_to_an_archived_child(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "compression", 1, "Old", 0,
+         "agent:main:local:dm:local-old", 2.0),
+        ("local-child", "local", "m", "local-old", 3.0, 4.0, None, 1, "Child", 1,
+         "agent:main:local:dm:local-child", 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-old", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []

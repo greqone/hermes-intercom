@@ -645,7 +645,9 @@ def _ancestor_descendants(
     live = [
         c for c in candidates if not c.get("_archived") and not c.get("_cron") and c.get("_active", True)
     ]
-    return live or candidates
+    # An archived or cron descendant is not a conversation to deliver into. Falling back to it
+    # made a compressed ancestor resolve to a session the user had already closed (Finding C).
+    return live
 
 
 def _resolve_ancestor_alias(
