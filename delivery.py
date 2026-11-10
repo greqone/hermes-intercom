@@ -627,13 +627,7 @@ def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id:
     )
     if not session_id or not same:
         return False
-    spellings = [
-        record.get("target_text") or "",
-        result.get("target_session_id") or "",
-        result.get("target_title") or "",
-        result.get("target_session_key") or "",
-    ]
-    return target_arg in spellings or session_id.startswith(target_arg.lower())
+    return True
 
 
 def _receipt(home: Any, request_id: str) -> tuple[str, str, str]:

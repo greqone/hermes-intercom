@@ -808,6 +808,29 @@ def test_r6_a_gateway_retry_replays_before_the_hop_check(tmp_path, monkeypatch) 
     assert calls["n"] == 0
 
 
+def test_r6_a_retry_by_a_title_fragment_or_other_case_does_not_submit_again(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls = {"n": 0}
+
+    def _ok(*_a, **kwargs):
+        calls["n"] += 1
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-title-case")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    for spelling in ("Targ", "TARGET"):
+        retry = _send(ctx, target=spelling, message="hello", request_id="gw-title-case")
+        assert retry.get("replayed") is True, (spelling, retry)
+    assert calls["n"] == 1
+
+
 # --- R5-S01: a reset ends the old conversation -----------------------------
 
 def test_r5_s01_idle_and_daily_endings_are_not_targets(tmp_path) -> None:
