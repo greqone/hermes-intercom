@@ -174,6 +174,10 @@ def test_r6_a_a_receipt_does_not_cross_two_homes(tmp_path, monkeypatch) -> None:
     second = _send(ctx_b, target="local-target-0001", message="hello", request_id="cross-home")
     assert second["ok"] is True, second
     assert second.get("outcome") != "cancelled", second
+    ctx_b._allow_inject = True
+    third = _send(ctx_b, target="local-target-0001", message="by inject", request_id="cross-home-inject")
+    assert third["ok"] is True and third["delivery_method"] == "inject_message", third
+    assert third.get("outcome") != "cancelled", third
 
 
 def test_r5_d02_a_later_hop_does_not_hide_an_accepted_result(tmp_path) -> None:

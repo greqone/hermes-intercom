@@ -531,11 +531,10 @@ def submit_via_gateway_ws(
                                 reference = receipt.get("reference") or ""
                             if receipt_key:
                                 with _LOCK:
-                                    for key in (receipt_key, request_id):
-                                        if _RECEIPT_STATUS.get(key) != "terminal":
-                                            _RECEIPT_STATUS[key] = status
-                                            _RECEIPT_OUTCOME[key] = "" if outcome is None else str(outcome)
-                                            _RECEIPT_REFERENCE[key] = reference
+                                    if _RECEIPT_STATUS.get(receipt_key) != "terminal":
+                                        _RECEIPT_STATUS[receipt_key] = status
+                                        _RECEIPT_OUTCOME[receipt_key] = "" if outcome is None else str(outcome)
+                                        _RECEIPT_REFERENCE[receipt_key] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -649,6 +648,8 @@ def _receipt(home: Any, request_id: str) -> tuple[str, str, str]:
     status = _stored(_RECEIPT_STATUS, key)
     if status:
         return (status, _stored(_RECEIPT_OUTCOME, key), _stored(_RECEIPT_REFERENCE, key))
+    if any(isinstance(stored, tuple) and len(stored) > 1 and stored[1] == request_id for stored in _RECEIPT_STATUS):
+        return ("", "", "")
     return (
         _stored(_RECEIPT_STATUS, request_id),
         _stored(_RECEIPT_OUTCOME, request_id),
