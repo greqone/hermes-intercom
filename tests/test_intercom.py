@@ -591,6 +591,8 @@ def test_resilient_per_key_settings_and_rate_limiting(
     assert cfg["dedup_window_seconds"] == 0
     assert cfg["max_messages_per_window"] == 2
     assert cfg["burst_window_seconds"] == 1
+    # Exercise the rate contract, not the filesystem speed within a one-second window.
+    monkeypatch.setattr(hermes_intercom.delivery.time, "monotonic", lambda: 100.0)
 
     r1 = json.loads(send_fn({"target": sid_b, "message": "msg 1"}, session_id=sid_a))
     r2 = json.loads(send_fn({"target": sid_b, "message": "msg 2"}, session_id=sid_a))
