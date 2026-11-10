@@ -378,6 +378,11 @@ def query_sessions(
             return []
         sid_to_key, _key_to_entry = _load_routing_map(con, home)
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
         order = ""
         if "last_activity_at" in colset and "started_at" in colset:
             order = " ORDER BY COALESCE(last_activity_at, started_at, 0) DESC"
@@ -480,6 +485,7 @@ def query_sessions(
             "_cron": is_cron,
             "_active": item_active,
             "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
+            "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
         }
 
         dedup_key = skey or sid
