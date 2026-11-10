@@ -463,6 +463,46 @@ def test_r6_a_late_queued_reply_does_not_erase_a_started_receipt(tmp_path, monke
     assert second.get("admission_status") == "started", second
 
 
+def test_r6_an_unknown_receipt_is_reported_as_unknown(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "started", "outcome": None, "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "unknown", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-unknown")
+    second = _send(ctx, target="local-target", message="hello", request_id="receipt-unknown")
+    assert first.get("admission_status") == "started", first
+    assert second.get("admission_status") == "unknown", second
+
+
 def test_r6_a_gateway_retry_by_prefix_does_not_submit_again(tmp_path, monkeypatch) -> None:
     _home, ctx = _pair(tmp_path)
     ctx._allow_inject = False

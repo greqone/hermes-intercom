@@ -97,7 +97,7 @@ _RECEIPT_OUTCOME: _ReceiptView = _ReceiptView()
 _RECEIPT_REFERENCE: _ReceiptView = _ReceiptView()
 # A receipt only moves forward. queued and started may become terminal. A late snapshot of an
 # earlier state never replaces a later one, so started does not fall back to queued.
-_RECEIPT_RANK = {"queued": 1, "admitted": 1, "started": 2, "terminal": 3}
+_RECEIPT_RANK = {"queued": 1, "admitted": 1, "started": 2, "unknown": 3, "terminal": 4}
 
 
 def shutdown_discovery_executor() -> None:
