@@ -569,6 +569,17 @@ def _message_text(user_message: Any) -> str:
     return ""
 
 
+def _same_operation_target(record: dict[str, Any], target_arg: str) -> bool:
+    """The retry names the same conversation the first call resolved, however it spelled it."""
+    result = record.get("result") or {}
+    return target_arg in (
+        record.get("target_text"),
+        result.get("target_session_id"),
+        result.get("target_title"),
+        result.get("target_session_key"),
+    )
+
+
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
     """A delivered inject can be dropped. A gateway send stays until its receipt is terminal:
     queued, started and unknown may still land, so forgetting them lets the same request id
@@ -888,11 +899,14 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         if (
             prior_early is not None
             and prior_early.get("delivered")
-            and prior_early.get("delivery_method") != "gateway_ws"
             and prior_early.get("body") == message_body
             and bool(prior_early.get("expect_reply")) == bool(expect_reply)
-            and prior_early["result"].get("target_session_id") == target_arg
             and prior_early["result"].get("from_session_id") == caller_sid
+            and (
+                prior_early.get("delivery_method") != "gateway_ws"
+                or prior_early["result"].get("status") == "terminal"
+            )
+            and _same_operation_target(prior_early, target_arg)
         ):
             return _json({**prior_early["result"], "replayed": True})
 
@@ -978,7 +992,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         # An inbound card may lower this profile's loop budget, never raise it (W204).
         max_hops = min(max_hops, sender_max_hops)
 
-    if next_hop > max_hops:
+    if next_hop > max_hops and not (
+        supplied_request
+        and (_OPERATIONS.get(supplied_request) or {}).get("delivery_method") == "gateway_ws"
+    ):
         return _json(
             {
                 "ok": False,
@@ -1350,6 +1367,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "envelope": payload,
             "body": message_body,
             "expect_reply": bool(expect_reply),
+            "target_text": target_arg,
             "result": result,
         }
     return _json(result)

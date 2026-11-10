@@ -549,8 +549,8 @@ def test_f14_manager_home_beats_the_ambient_env(tmp_path: Path, monkeypatch) -> 
     assert plugin.store.resolve_home(Host()) == profile.resolve()
 
 
-def test_r3_gateway_retry_does_not_inject_a_second_copy(tmp_path: Path, monkeypatch) -> None:
-    """R3-01: a finished gateway send, retried once inject works, must not deliver twice."""
+def test_r3_gateway_retry_replays_the_accepted_result(tmp_path: Path, monkeypatch) -> None:
+    """An accepted gateway send is returned as-is. A retry must not submit again."""
     home, ctx = _routed_pair(tmp_path)
     ctx._allow_inject = False
     ctx.allow_gateway_injection = True
@@ -560,15 +560,16 @@ def test_r3_gateway_retry_does_not_inject_a_second_copy(tmp_path: Path, monkeypa
     def _ws(*_a, **kwargs):
         calls.append(kwargs.get("request_id", ""))
         ctx._allow_inject = True
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
         return True, "adm-1"
 
     monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
     first = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
     second = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
     assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
-    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
+    assert second.get("replayed") is True and second["delivery_method"] == "gateway_ws"
     assert ctx.injected == []
-    assert calls == ["op-ws", "op-ws"]
+    assert calls == ["op-ws"]
 
 
 def test_r3_unknown_delivery_can_be_retried(tmp_path: Path, monkeypatch) -> None:

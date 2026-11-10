@@ -57,9 +57,14 @@ _SESSION_OPTIONAL_COLUMNS = (
 
 # End reasons that mark a session segment as a superseded compression ancestor.
 _COMPRESSED_END_REASONS = frozenset({"compression", "compressed"})
-# A row ended for any of these keeps the key the live conversation now owns. Naming it delivers
-# into the new conversation while the result still quotes the old id (R5-S01).
-_RESET_END_REASONS = frozenset({"session_reset", "idle", "daily"})
+# A row ended for any of these is a conversation the host will not resume. Naming it delivers into
+# the conversation that inherited its key while the result still quotes the old id (R5-S01).
+# The set is the host's own, from hermes_state_common.py: the reset reasons plus 'new_session',
+# which is how the CLI ends the predecessor on /new.
+_BOUNDARY_END_REASONS = frozenset({
+    "session_reset", "session_switch", "idle", "daily", "suspended",
+    "resume_pending_expired", "new_session",
+})
 _AUTOMATIC_END_REASONS = frozenset({
     "agent_close", "ws_orphan_reap", "superseded_by_resume", "startup_orphan_reap",
     "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict",
@@ -619,7 +624,7 @@ def _ancestor_descendants(
                     continue
                 parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
                 parent_reason = str(_row_get(child, "parent_end_reason") or "").strip().lower()
-                if _is_branch_edge(_row_get(child, "model_config"), parent_id) or parent_reason in _RESET_END_REASONS:
+                if _is_branch_edge(_row_get(child, "model_config"), parent_id) or parent_reason in _BOUNDARY_END_REASONS:
                     branched.add(cid.lower())
                     continue
                 chain.append(cid.lower())
@@ -874,7 +879,7 @@ def resolve_target(
         # A row ended by session_reset keeps the key the live conversation now owns. Returning it
         # makes the host dispatcher deliver into that new conversation while this result names the
         # old id (S-R01). The ended id is not a target.
-        if str(direct.get("_end_reason") or "").strip().lower() in _RESET_END_REASONS:
+        if str(direct.get("_end_reason") or "").strip().lower() in _BOUNDARY_END_REASONS:
             return None, []
         return direct, []
 
@@ -925,7 +930,7 @@ def resolve_target(
 
     # Tier 2 - unique id/root-id prefix of at least MIN_ID_PREFIX_LEN characters.
     if prefix_hits:
-        reset_free = [s for s in prefix_hits if s.get("_end_reason") not in _RESET_END_REASONS]
+        reset_free = [s for s in prefix_hits if s.get("_end_reason") not in _BOUNDARY_END_REASONS]
         if not reset_free:
             return None, []
         if len(reset_free) == 1:
@@ -954,7 +959,7 @@ def resolve_target(
         pool = [
             s
             for s in non_cron
-            if s.get("_end_reason") not in _RESET_END_REASONS
+            if s.get("_end_reason") not in _BOUNDARY_END_REASONS
             and s["title"]
             and (
                 _same_title(s["title"].strip(), needle)
@@ -1039,6 +1044,24 @@ def lookup_sender_info(
     }
 
 
+def _unwrap_carrier(text: str) -> str:
+    """The live part of a merged compression carrier, or the text itself when it is not one.
+
+    The host folds a summary into a carried row two ways (agent/context_compressor.py): the prior
+    context leads and the summary follows the delimiter, or the summary leads and the live text
+    follows the end marker. Either way the card that decides the hop sits outside the summary, and
+    reading the wrapped string finds no leading card, so an exhausted chain sends again at hop 1.
+    """
+    if "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]" in text:
+        head = text.split("[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]", 1)[0]
+        header = "[PRIOR CONTEXT — for reference only; not a new message]"
+        return head.replace(header, "", 1).strip()
+    marker = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text
+
+
 def parse_intercom_tag(text: str | None) -> tuple[int, int]:
     """Return ``(hop, sender_max_hops)`` for the inbound intercom card in ``text``.
 
@@ -1051,6 +1074,7 @@ def parse_intercom_tag(text: str | None) -> tuple[int, int]:
     """
     if not text or not isinstance(text, str):
         return 0, 0
+    text = _unwrap_carrier(text)
     m = INTERCOM_CARD_PREFIX_RE.match(text)
     if m is None:
         m = BARE_INTERCOM_TAG_RE.match(text)

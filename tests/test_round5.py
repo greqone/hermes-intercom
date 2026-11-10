@@ -11,7 +11,11 @@ import sqlite3
 from pathlib import Path
 
 import importlib.util
+import sys
 import pytest
+
+import hermes_cli.gateway_runtime as _gateway_runtime
+import hermes_cli.gateway_client as _gateway_client
 
 _SPEC = importlib.util.spec_from_file_location(
     "_intercom_helpers", Path(__file__).resolve().parent / "test_intercom.py"
@@ -211,8 +215,8 @@ def test_r5_d05_a_queued_receipt_does_not_inherit_a_cancelled_outcome(tmp_path, 
         endpoint = "ws://127.0.0.1:9"
         state = "ready"
 
-    runtime = importlib.import_module("hermes_cli.gateway_runtime")
-    client_mod = importlib.import_module("hermes_cli.gateway_client")
+    runtime = _gateway_runtime
+    client_mod = _gateway_client
 
     def _attr(parts, name):
         if name == "discover_gateway_endpoint":
@@ -309,9 +313,8 @@ def test_r5_d05_b_a_late_queued_reply_does_not_keep_the_terminal_outcome(tmp_pat
     assert first.get("outcome") in (None, ""), first
     assert second.get("admission_status") == "terminal", second
     assert second.get("outcome") == "cancelled", second
-    stored_status = plugin.delivery._RECEIPT_STATUS.get("receipt-order")
-    stored_outcome = plugin.delivery._RECEIPT_OUTCOME.get("receipt-order")
-    assert (stored_status, stored_outcome) in (("queued", ""), ("terminal", "cancelled")), (stored_status, stored_outcome)
+    assert plugin.delivery._RECEIPT_STATUS.get("receipt-order") == "terminal"
+    assert plugin.delivery._RECEIPT_OUTCOME.get("receipt-order") == "cancelled"
 
 
 def test_r6_two_gateway_retries_do_not_both_submit(tmp_path, monkeypatch) -> None:
@@ -379,6 +382,33 @@ def test_r6_a_queued_gateway_send_is_not_evicted(tmp_path, monkeypatch) -> None:
     retry = _send(ctx, target="local-target-0001", message="hold me", request_id="queued-op")
     assert retry["delivery_method"] == "gateway_ws", retry
     assert len(ctx.injected) == before
+
+
+def test_r6_a_gateway_retry_replays_before_the_hop_check(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-replay")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    calls = {"n": 0}
+
+    def _counting(*_a, **_k):
+        calls["n"] += 1
+        return True, "adm-2"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _counting)
+    retry = _send(ctx, target="Target", message="hello", request_id="gw-replay")
+    assert retry.get("replayed") is True, retry
+    assert calls["n"] == 0
 
 
 # --- R5-S01: a reset ends the old conversation -----------------------------
@@ -486,8 +516,11 @@ def test_r5_a02_a_host_ref_object_stays_a_session_id(tmp_path, monkeypatch) -> N
     ctx.allow_gateway_injection = True
     plugin = _load_plugin()
 
+    seen = {"n": 0}
+
     class _Client:
         async def rpc(self, method, **_kwargs):
+            seen["n"] += 1
             if method == "session.resume":
                 return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
             return {"admission_id": "adm-1", "status": "queued", "outcome": None,
@@ -513,6 +546,7 @@ def test_r5_a02_a_host_ref_object_stays_a_session_id(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
     result = _send(ctx, target="local-target-0001", message="hello", request_id="ref-1")
     assert result["ok"] is True
+    assert seen["n"] > 0, result
     assert result["reference"] == "local-target-0001"
 
 
@@ -571,3 +605,86 @@ def test_r5_s01_a_reset_rows_prefix_does_not_reach_its_successor(tmp_path) -> No
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "local-oldro", caller_session_id="local-caller-0001")
     assert resolved is None and ambiguous == []
+
+
+# The host's boundary set, copied from hermes_state_common.py. A compression line must not
+# cross any of them. session_reset, idle and daily are already covered above.
+_HOST_BOUNDARY_REASONS = ("session_switch", "suspended", "resume_pending_expired", "new_session")
+
+
+@pytest.mark.parametrize("reason", _HOST_BOUNDARY_REASONS)
+def test_r6_a_host_boundary_reason_stops_the_compression_line(tmp_path, reason) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, reason, 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == [], reason
+
+
+def test_r6_a_shared_key_does_not_cross_a_reset(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("local-new", "local", "m", None, 3.0, None, None, 1, "New", 0, key, 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, key, caller_session_id="local-caller-0001")
+    assert resolved is not None and resolved["session_id"] == "local-new", (resolved, ambiguous)
+
+
+def test_r6_a_merged_carrier_keeps_the_exhausted_hop(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    prior = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\n" + card
+        + "\n\n[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    leading = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
+        + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES ('local-caller-0001', 'user', ?, ?, 1, NULL)",
+        [(prior, 1.0), (leading, 2.0)],
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is False and result["error"] == "max_hops_exceeded", result
+
+
+def test_r6_a_genuine_ask_after_the_summary_renews_the_budget(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    merged = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\nPlease send a fresh update.\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] " + card + "\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, 1, NULL)",
+        (merged,),
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is True and result["hop"] == 1, result
