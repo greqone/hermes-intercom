@@ -33,7 +33,27 @@ _MESSAGE_MAX_CHARS = 32 * 1024
 
 # One operation, keyed by request_id, so a retry replays the first outcome instead of delivering
 # again. ``payload_hash`` is the body as accepted; a different body under the same id conflicts.
-_OPERATIONS: dict[str, dict[str, Any]] = {}
+class _OperationsView(dict):
+    """Reads an operation by its request id even when the store keys it as (home, id).
+
+    Writes still use the real key, so a test that plants a bare id keeps doing that.
+    """
+
+    def __contains__(self, key: object) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        return _operation_record(str(key)) is not None
+
+    def __getitem__(self, key: object) -> dict:
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        found = _operation_record(str(key))
+        if found is None:
+            raise KeyError(key)
+        return found
+
+
+_OPERATIONS: _OperationsView = _OperationsView()
 _OPERATION_MAX = 4096
 
 # One bucket per target. A long-lived process that talks to a new target every time must not
@@ -598,13 +618,35 @@ def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id:
     return target_arg in spellings or session_id.startswith(target_arg.lower())
 
 
+def _receipt(request_id: str) -> tuple[str, str, str]:
+    """The receipt for one request id."""
+    return (
+        _RECEIPT_STATUS.get(request_id, ""),
+        _RECEIPT_OUTCOME.get(request_id, ""),
+        _RECEIPT_REFERENCE.get(request_id, ""),
+    )
+
+
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
     """A delivered inject can be dropped. A gateway send stays until its receipt is terminal:
     queued, started and unknown may still land, so forgetting them lets the same request id
     deliver a second copy through inject_message."""
     if record.get("delivery_method") == "gateway_ws":
-        return _RECEIPT_STATUS.get(token) != "terminal" or not record.get("delivered")
+        receipt_id = token[1] if isinstance(token, tuple) and len(token) > 1 else token
+        status, _outcome, _reference = _receipt(receipt_id)
+        return status != "terminal" or not record.get("delivered")
     return not record.get("delivered") and not record.get("result")
+
+
+def _operation_record(request_id: str) -> dict[str, Any] | None:
+    """The stored operation for a request id, whether its key is the bare id or (home, id)."""
+    direct = _OPERATIONS.get(request_id)
+    if isinstance(direct, dict):
+        return direct
+    for key, record in _OPERATIONS.items():
+        if isinstance(key, tuple) and len(key) > 1 and key[1] == request_id and isinstance(record, dict):
+            return record
+    return None
 
 
 def _make_room_for_operation() -> bool:
@@ -614,10 +656,15 @@ def _make_room_for_operation() -> bool:
         finished = next((token for token, record in _OPERATIONS.items() if not _operation_is_live(record, token)), None)
         if finished is None:
             return False
+        record = _OPERATIONS.get(finished) or {}
         _OPERATIONS.pop(finished, None)
-        _RECEIPT_STATUS.pop(finished, None)
-        _RECEIPT_OUTCOME.pop(finished, None)
-        _RECEIPT_REFERENCE.pop(finished, None)
+        result = record.get("result") or {}
+        receipt_id = result.get("request_id") or (
+            finished[1] if isinstance(finished, tuple) and len(finished) > 1 else finished
+        )
+        _RECEIPT_STATUS.pop(receipt_id, None)
+        _RECEIPT_OUTCOME.pop(receipt_id, None)
+        _RECEIPT_REFERENCE.pop(receipt_id, None)
     return True
 
 
@@ -956,8 +1003,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         )
 
     if supplied_request:
+        home_key = str(home)
         with _LOCK:
-            prior_early = _OPERATIONS.get(supplied_request)
+            prior_early = _OPERATIONS.get((home_key, supplied_request))
         if (
             prior_early is not None
             and prior_early.get("delivered")
@@ -1013,7 +1061,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     if next_hop > max_hops and not (
         supplied_request
-        and (_OPERATIONS.get(supplied_request) or {}).get("delivery_method") == "gateway_ws"
+        and (_OPERATIONS.get((home_key, supplied_request)) or {}).get("delivery_method") == "gateway_ws"
     ):
         return _json(
             {
@@ -1039,7 +1087,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "error": "invalid_request_id",
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
-    send_token = supplied_request or uuid.uuid4().hex
+    send_token = (home_key, supplied_request) if supplied_request else ("", uuid.uuid4().hex)
+    public_request = supplied_request or send_token[1]
     identity = "\n".join((
         str(resolved["session_id"]), target_key, caller_sid, str(bool(expect_reply)), message_body,
     ))
@@ -1057,7 +1106,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             return _json({
                 "ok": False,
                 "error": "request_conflict",
-                "request_id": send_token,
+                "request_id": public_request,
                 "message": "request_id was already used with a different message.",
             })
         if prior is not None and prior.get("delivered") and prior.get("delivery_method") != "gateway_ws":
@@ -1073,7 +1122,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             return _json({
                 "ok": False,
                 "error": "request_in_flight",
-                "request_id": send_token,
+                "request_id": public_request,
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
         if ws_retry:
@@ -1084,7 +1133,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             return _json({
                 "ok": False,
                 "error": "request_in_flight",
-                "request_id": send_token,
+                "request_id": public_request,
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
         if prior is None:
@@ -1095,7 +1144,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 return _json({
                     "ok": False,
                     "error": "operation_capacity",
-                    "request_id": send_token,
+                    "request_id": public_request,
                     "message": "Too many deliveries are still unconfirmed. Retry once one of them settles.",
                 })
             # Claimed before delivery so a second caller with the same id waits on this one
@@ -1105,7 +1154,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         _evict_stale_send_buckets(now_mono)
         history, retained = _recent_sends_for(bucket_key, now_mono, keep_win)
         if dedup_win > 0 and any(
-            sender == caller_sid and d == digest and (now_mono - ts) < dedup_win and tok != send_token
+            sender == caller_sid and d == digest and (now_mono - ts) < dedup_win and tok != public_request
             for ts, sender, d, tok in history
         ):
             if prior is None:
@@ -1122,7 +1171,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         seen_tokens = {
             tok for ts, _sender, _d, tok in history if tok and (now_mono - ts) < burst_win
         }
-        if send_token not in seen_tokens and len(seen_tokens) >= max_per_win:
+        if send_token[1] not in seen_tokens and len(seen_tokens) >= max_per_win:
             if prior is None:
                 _OPERATIONS.pop(send_token, None)
             return _json(
@@ -1132,8 +1181,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     "message": f"Rate limit reached: {max_per_win} messages to {resolved['session_id']} within {burst_win}s.",
                 }
             )
-        if not any(tok == send_token for _ts, _sender, _d, tok in retained):
-            retained.append((now_mono, caller_sid, digest, send_token))
+        if not any(tok == public_request for _ts, _sender, _d, tok in retained):
+            retained.append((now_mono, caller_sid, digest, public_request))
         _RECENT_SENDS[bucket_key] = retained
         while len(_RECENT_SENDS) > _RECENT_SENDS_MAX_BUCKETS:
             oldest = min(
@@ -1204,7 +1253,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 return _json({
                     "ok": False,
                     "error": "store_unavailable",
-                    "request_id": send_token,
+                    "request_id": public_request,
                     "message": "The session store could not be read after the send was claimed. Nothing was delivered. Retry.",
                 })
             if has_index:
@@ -1239,7 +1288,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         return _json({
             "ok": False,
             "error": "route_unverified",
-            "request_id": send_token,
+            "request_id": public_request,
             "target_session_id": resolved["session_id"],
             "message": "No confirmed route exists for this session. The stored session_key is metadata, not a route.",
         })
@@ -1262,7 +1311,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     admission_id = ""
     if not accepted and gateway_granted and dormant_local:
         ws_ok, ws_err = submit_via_gateway_ws(
-            home, mount_sid, payload, timeout=_budget(), request_id=send_token
+            home, mount_sid, payload, timeout=_budget(), request_id=public_request
         )
         if ws_ok:
             accepted = True
@@ -1282,7 +1331,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 remaining = [
                     entry
                     for entry in _RECENT_SENDS.get(bucket_key, [])
-                    if not (len(entry) > 3 and entry[3] == send_token)
+                    if not (len(entry) > 3 and entry[3] == public_request)
                 ]
                 if remaining:
                     _RECENT_SENDS[bucket_key] = remaining
@@ -1318,7 +1367,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 if _classic_cli_host(ctx) and (not gateway_granted or not dormant_local)
                 else "delivery_unknown" if unknown else "injection_refused"
             ),
-            "request_id": send_token,
+            "request_id": public_request,
             "target_session_id": resolved["session_id"],
             "target_session_key": target_key,
             "mounted_dormant": mounted_dormant,
@@ -1346,14 +1395,15 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         "mounted_dormant": mounted_dormant,
         "delivery_method": delivery_method,
         "digest": digest,
-        "request_id": send_token,
+        "request_id": public_request,
         "admission_id": admission_id,
     }
     _append_audit(home, audit_row)
 
+    receipt_status, receipt_outcome, receipt_reference = _receipt(public_request)
     result = {
         "ok": True,
-        "status": _RECEIPT_STATUS.get(send_token) or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
+        "status": receipt_status or ("admitted" if delivery_method == "gateway_ws" else "scheduled"),
         "delivery_method": delivery_method,
         "from_session_id": sender_info["session_id"],
         "target_session_id": resolved["session_id"],
@@ -1363,11 +1413,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         "max_hops": max_hops,
         "expect_reply": expect_reply,
         "mounted_dormant": mounted_dormant,
-        "request_id": send_token,
+        "request_id": public_request,
         "admission_id": admission_id,
-        "admission_status": _RECEIPT_STATUS.get(send_token, ""),
-        "outcome": _RECEIPT_OUTCOME.get(send_token, ""),
-        "reference": _RECEIPT_REFERENCE.get(send_token, ""),
+        "admission_status": receipt_status,
+        "outcome": receipt_outcome,
+        "reference": receipt_reference,
         "note": (
             "The gateway accepted this prompt into the target session."
             if delivery_method == "gateway_ws" else
@@ -1387,6 +1437,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "body": message_body,
             "expect_reply": bool(expect_reply),
             "target_text": target_arg,
+            "home": home_key,
             "result": result,
         }
     return _json(result)

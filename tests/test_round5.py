@@ -139,6 +139,18 @@ def test_r5_d02_compression_rotation_replays_the_same_operation(tmp_path) -> Non
     assert len(ctx.injected) == 1
 
 
+def test_r6_a_a_request_id_does_not_replay_across_two_homes(tmp_path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    home_a, ctx_a = _pair(tmp_path / "a")
+    home_b, ctx_b = _pair(tmp_path / "b")
+    first = _send(ctx_a, target="local-target-0001", message="hello", request_id="shared-id")
+    assert first["ok"] is True
+    second = _send(ctx_b, target="local-target-0001", message="hello", request_id="shared-id")
+    assert second.get("replayed") is not True, second
+    assert len(ctx_b.injected) == 1
+
+
 def test_r5_d02_a_later_hop_does_not_hide_an_accepted_result(tmp_path) -> None:
     home, ctx = _pair(tmp_path)
     first = _send(ctx, target="local-target-0001", message="hello", request_id="same-op")
