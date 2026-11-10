@@ -51,8 +51,8 @@ SESSION_SEND_SCHEMA: dict = {
         "Send a message to another Hermes session in the same profile (by session_id, prefix, session_key, "
         "or unique title substring). Wakes an idle target session as a new turn or, when the target is "
         "busy, hands the message to the host scheduler. The result says `scheduled` when the host "
-        "accepted it for scheduling, or `admitted` when the gateway WebSocket fallback holds an "
-        "admission record. Neither is a durable queue and neither promises the turn will run. "
+        "accepted it for scheduling. The gateway WebSocket fallback returns the host's own receipt "
+        "status: `queued`, `started`, `unknown` or `terminal`. Neither is a durable queue and neither promises the turn will run. "
         "Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
         "loop protection so two sessions can exchange a bounded reply without infinite ping-pong."
     ),
