@@ -509,6 +509,34 @@ def test_r6_a_retry_after_a_reset_does_not_replay_the_old_session(tmp_path, monk
     assert retry.get("target_session_id") != "local-target-0001"
 
 
+def test_r6_a_a_reset_then_a_compression_does_not_replay_the_old_session(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    key = "agent:main:local:dm:local-target-0001"
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="reset-then-compress")
+    assert first["ok"] is True
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("UPDATE sessions SET ended_at=10, end_reason='session_reset' WHERE id='local-target-0001'")
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-next', 'local', 'm', 'local-target-0001', 11.0, 13.0, 'compression', 1, "
+        "'Next', 0, ?, 12.0)",
+        (key,),
+    )
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-grandchild', 'local', 'm', 'local-target-next', 14.0, NULL, NULL, 1, "
+        "'Next', 0, ?, 15.0)",
+        (key,),
+    )
+    con.commit()
+    con.close()
+    retry = _send(ctx, target=key, message="hello", request_id="reset-then-compress")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("target_session_id") != "local-target-0001"
+
+
 def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
     home = _home(tmp_path)
     key = "agent:main:local:dm:local-a"

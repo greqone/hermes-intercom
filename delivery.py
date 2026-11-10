@@ -574,21 +574,19 @@ def _message_text(user_message: Any) -> str:
 
 
 def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id: str = "",
-                          resolved_root: str = "", parent_reason: str = "") -> bool:
+                          home: Any = None) -> bool:
     """The retry names the same conversation the first call resolved.
 
     The text the caller typed counts only together with the session it resolves to. A title that
-    happens to equal another session's id must not replay the wrong one. A compression child keeps
-    its parent's root, and only a parent ended by compression makes that root the same conversation.
-    A reset keeps the key too, and replaying across it would hand back the old session's result.
+    happens to equal another session's id must not replay the wrong one. A later session counts
+    only when the whole line back to the stored one is compression, with no reset in it.
     """
     result = record.get("result") or {}
     session_id = (result.get("target_session_id") or "").lower()
-    compression_child = (
-        bool(resolved_root) and resolved_root.lower() == session_id
-        and parent_reason in ("compression", "compressed")
+    same = resolved_id.lower() == session_id or (
+        home is not None and bool(session_id)
+        and store.compression_line(home, resolved_id, session_id)
     )
-    same = resolved_id.lower() == session_id or compression_child
     if not session_id or not same:
         return False
     spellings = [
@@ -970,11 +968,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 prior_early.get("delivery_method") != "gateway_ws"
                 or prior_early["result"].get("status") == "terminal"
             )
-            and _same_operation_target(
-                prior_early, target_arg, resolved["session_id"],
-                resolved.get("root_session_id") or "",
-                resolved.get("_parent_end_reason") or "",
-            )
+            and _same_operation_target(prior_early, target_arg, resolved["session_id"], home)
         ):
             return _json({**prior_early["result"], "replayed": True})
 

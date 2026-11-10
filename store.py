@@ -566,6 +566,59 @@ def _is_branch_edge(model_config: Any, ancestor_id: str) -> bool:
     return any(str(parsed.get(key) or "").strip().lower() == ancestor_id.lower() for key in markers)
 
 
+def compression_line(home: Path, resolved_id: str, stored_id: str) -> bool:
+    """True when ``resolved_id`` continues ``stored_id`` by compression alone.
+
+    Every link from the resolved session back to the stored one has to end by compression and carry
+    no branch, reset or delegate marker. One reset anywhere in that line makes it a different
+    conversation, so a retry must not replay the old result into it.
+    """
+    start = (resolved_id or "").strip().lower()
+    target = (stored_id or "").strip().lower()
+    if not start or not target or start == target:
+        return start == target and bool(start)
+    db_path = Path(home) / "state.db"
+    if not db_path.is_file():
+        return False
+    con: sqlite3.Connection | None = None
+    try:
+        con = _connect_ro(db_path)
+        colset = {c.lower() for c in _column_names(con, "sessions")}
+        if "id" not in colset or "parent_session_id" not in colset or "end_reason" not in colset:
+            return False
+        has_config = "model_config" in colset
+        current = start
+        seen: set[str] = set()
+        for _ in range(6):
+            if not current or current in seen:
+                return False
+            seen.add(current)
+            row = con.execute(
+                "SELECT parent_session_id"
+                + (", model_config" if has_config else "")
+                + ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                + " AS parent_end_reason FROM sessions WHERE lower(id) = ? LIMIT 1",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return False
+            parent = str(_row_get(row, "parent_session_id") or "").strip().lower()
+            reason = str(_row_get(row, "parent_end_reason") or "").strip().lower()
+            if reason not in _COMPRESSED_END_REASONS:
+                return False
+            if has_config and _is_branch_edge(_row_get(row, "model_config"), parent):
+                return False
+            if parent == target:
+                return True
+            current = parent
+        return False
+    except sqlite3.Error:
+        return False
+    finally:
+        if con is not None:
+            con.close()
+
+
 def _same_title(left: str, right: str) -> bool:
     """Unicode-aware equality. ``casefold`` folds Ż→ż and ß→ss; SQLite ``lower()`` folds neither."""
     return left.casefold() == right.casefold()
