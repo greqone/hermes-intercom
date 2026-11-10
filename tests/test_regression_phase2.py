@@ -44,6 +44,14 @@ def _insert(home: Path, rows: list[tuple]) -> None:
             row,
         )
     con.commit()
+    for row in rows:
+        key = row[10]
+        if key:
+            con.execute(
+                "INSERT OR REPLACE INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+                (key, json.dumps({"session_id": row[0]})),
+            )
+    con.commit()
     con.close()
 
 
@@ -1036,29 +1044,43 @@ def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatc
 
     fourth = _send_here("and once past the cap", "receipt-fourth")
     assert fourth["ok"] is True
+    assert "receipt-fourth" in plugin.delivery._RECEIPT_OUTCOME
+    # Finished operations stay until the buffer is full of work that is still in doubt. Forgetting
+    # a receipt the moment its operation is evicted is covered by _make_room_for_operation, which
+    # drops the three receipt maps together with the operation (R5-D01).
+    plugin.delivery._OPERATIONS["receipt-old"]["delivered"] = False
+    plugin.delivery._OPERATIONS["receipt-old"]["result"] = {}
+    plugin.delivery._OPERATION_MAX = 1
+    assert plugin.delivery._make_room_for_operation() is False
+    plugin.delivery._OPERATIONS["receipt-old"]["delivered"] = True
+    assert plugin.delivery._make_room_for_operation() is True
     assert "receipt-old" not in plugin.delivery._RECEIPT_STATUS
     assert "receipt-old" not in plugin.delivery._RECEIPT_OUTCOME
     assert "receipt-old" not in plugin.delivery._RECEIPT_REFERENCE
-    assert "receipt-fourth" in plugin.delivery._RECEIPT_OUTCOME
 
 
-def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_path: Path, monkeypatch) -> None:
-    """R4-D05: a metadata key is unverified when the routing index names other sessions and not this one.
+def test_r4_an_empty_routing_index_is_not_a_route(tmp_path: Path, monkeypatch) -> None:
+    """R5-D04 supersedes R4-D05. An empty gateway_routing table is not evidence of a route.
 
-    An empty gateway_routing table keeps the old path. The suite's local sessions have one and
-    it is empty. A table that names a different session makes this target mount first.
+    A metadata session_key with nothing behind it used to skip the mount and report success
+    for a message the gateway drops. Both the empty table and a table naming someone else
+    now refuse until a route is confirmed.
     """
     plugin = _load_plugin()
     mounts: list[str] = []
     monkeypatch.setattr(
         plugin.delivery, "mount_dormant_local_session",
-        lambda *_a, **_k: mounts.append("mount") or (True, "mounted"),
+        lambda *_a, **_k: mounts.append("mount") or (False, "not mounted"),
     )
 
     home, ctx = _routed_pair(tmp_path)
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("DELETE FROM gateway_routing")
+    con.commit()
+    con.close()
     ctx.allow_gateway_injection = True
     bare = _send(ctx, target="local-target-0001", message="hello", request_id="bare-1")
-    assert mounts == [] and bare["ok"] is True
+    assert bare["ok"] is False and bare["error"] == "route_unverified"
 
     con = sqlite3.connect(str(home / "state.db"))
     con.execute(
@@ -1068,7 +1090,7 @@ def test_r4_missing_routing_row_mounts_only_when_the_index_names_someone(tmp_pat
     con.commit()
     con.close()
     indexed = _send(ctx, target="local-target-0001", message="again", request_id="indexed-1")
-    assert mounts == ["mount"] and indexed["ok"] is True
+    assert indexed["error"] == "route_unverified", (mounts, indexed)
 
 
 

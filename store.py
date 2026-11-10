@@ -57,6 +57,9 @@ _SESSION_OPTIONAL_COLUMNS = (
 
 # End reasons that mark a session segment as a superseded compression ancestor.
 _COMPRESSED_END_REASONS = frozenset({"compression", "compressed"})
+# A row ended for any of these keeps the key the live conversation now owns. Naming it delivers
+# into the new conversation while the result still quotes the old id (R5-S01).
+_RESET_END_REASONS = frozenset({"session_reset", "idle", "daily"})
 
 
 
@@ -867,7 +870,7 @@ def resolve_target(
         # A row ended by session_reset keeps the key the live conversation now owns. Returning it
         # makes the host dispatcher deliver into that new conversation while this result names the
         # old id (S-R01). The ended id is not a target.
-        if str(direct.get("_end_reason") or "").strip().lower() == "session_reset":
+        if str(direct.get("_end_reason") or "").strip().lower() in _RESET_END_REASONS:
             return None, []
         return direct, []
 
@@ -1109,6 +1112,10 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
                     " AND (COALESCE(_compressed_summary, 0) = 0"
                     " OR COALESCE(_compressed_summary_has_user_turn, 0) != 0)"
                 )
+            # A rewind leaves the withdrawn row in place with active=0. Reading it hides the card
+            # the host still shows (R5-S02). A store without the column keeps the old query.
+            if "active" in msg_cols:
+                where += " AND COALESCE(active, 1) = 1"
             row = con.execute(
                 f"SELECT content FROM messages WHERE {where} ORDER BY {order_col} DESC LIMIT 1",
                 (current,),

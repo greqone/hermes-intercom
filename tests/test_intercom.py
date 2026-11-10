@@ -284,6 +284,12 @@ def _seed_two_sessions(db_path: Path) -> tuple[str, str]:
         ],
     )
     con.commit()
+    for sid in (sid_a, sid_b):
+        con.execute(
+            "INSERT OR REPLACE INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+            (f"agent:main:local:dm:{sid}", json.dumps({"session_id": sid})),
+        )
+    con.commit()
     con.close()
     return sid_a, sid_b
 
@@ -1073,6 +1079,13 @@ def _insert_session(db_path: Path, **fields: Any) -> str:
         ),
     )
     con.commit()
+    key = row["session_key"]
+    if key:
+        con.execute(
+            "INSERT OR REPLACE INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+            (key, json.dumps({"session_id": row["id"]})),
+        )
+        con.commit()
     con.close()
     return str(row["id"])
 
@@ -1363,6 +1376,10 @@ def test_exact_session_id_resolves_beyond_the_recency_window(
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (ancient, "local", "m", None, 1, None, None, 2, "/w", "Ancient", 0, 0,
          f"agent:main:local:dm:{ancient}", 1.0),
+    )
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        (f"agent:main:local:dm:{ancient}", json.dumps({"session_id": ancient})),
     )
     con.executemany(
         "INSERT INTO sessions (id, source, title, message_count, last_activity_at, session_key)"

@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -481,16 +482,18 @@ def submit_via_gateway_ws(
                         )
                         if isinstance(receipt, dict) and receipt.get("admission_id"):
                             admission_id = str(receipt["admission_id"])
-                            # A terminal or unknown receipt must not read as a fresh admission (F19).
+                            # One receipt, written once. Three separate maps let a late queued
+                            # snapshot keep the cancelled outcome of an earlier terminal one (R5-D05).
                             status = str(receipt.get("status") or "admitted")
-                            if request_id and status:
-                                _RECEIPT_STATUS[request_id] = status
-                            outcome = str(receipt.get("outcome") or "")
-                            reference = str(receipt.get("ref") or receipt.get("reference") or "")
-                            if request_id and outcome:
-                                _RECEIPT_OUTCOME[request_id] = outcome
-                            if request_id and reference:
-                                _RECEIPT_REFERENCE[request_id] = reference
+                            outcome = receipt.get("outcome")
+                            reference = receipt.get("ref")
+                            if reference is None:
+                                reference = receipt.get("reference") or ""
+                            if request_id:
+                                with _LOCK:
+                                    _RECEIPT_STATUS[request_id] = status
+                                    _RECEIPT_OUTCOME[request_id] = "" if outcome is None else str(outcome)
+                                    _RECEIPT_REFERENCE[request_id] = reference
                     finally:
                         if sub_id:
                             await _detach_session(client, resumed_sid, sub_id, _rem())
@@ -562,6 +565,28 @@ def _message_text(user_message: Any) -> str:
             if isinstance(value, str):
                 return value
     return ""
+
+
+def _operation_is_live(record: dict[str, Any]) -> bool:
+    """A delivered inject can be dropped. An in-flight claim and an unconfirmed gateway
+    submit cannot: the first may still be sending, the second may already have landed."""
+    if record.get("delivery_method") == "gateway_ws" and not record.get("delivered"):
+        return True
+    return not record.get("delivered") and not record.get("result")
+
+
+def _make_room_for_operation() -> bool:
+    """Drop finished operations until one slot is free. Live ones stay. Returns False when
+    every slot holds work that is still in doubt, so the caller must refuse instead."""
+    while len(_OPERATIONS) >= _OPERATION_MAX:
+        finished = next((token for token, record in _OPERATIONS.items() if not _operation_is_live(record)), None)
+        if finished is None:
+            return False
+        _OPERATIONS.pop(finished, None)
+        _RECEIPT_STATUS.pop(finished, None)
+        _RECEIPT_OUTCOME.pop(finished, None)
+        _RECEIPT_REFERENCE.pop(finished, None)
+    return True
 
 
 def _parse_hop(text: str) -> int:
@@ -844,6 +869,29 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         # Recover the caller id from its gateway key so the hop guard still applies (W204).
         caller_sid = caller_key.rsplit(":", 1)[-1].strip()
 
+    # A retry names work that already happened. Look it up before the hop guard and before the
+    # target is resolved again: compression rotates the physical session id, and a later turn can
+    # raise the hop, but neither changes the operation that was already accepted (R5-D02).
+    supplied_request = _sanitize_utf8(raw_request or "").strip()
+    if supplied_request and (len(supplied_request) > 1024 or any(ch.isspace() for ch in supplied_request)):
+        return _json({
+            "ok": False,
+            "error": "invalid_request_id",
+            "message": "request_id must be 1-1024 characters with no whitespace.",
+        })
+    if supplied_request:
+        with _LOCK:
+            prior_early = _OPERATIONS.get(supplied_request)
+        if (
+            prior_early is not None
+            and prior_early.get("delivered")
+            and prior_early.get("delivery_method") != "gateway_ws"
+            and prior_early.get("body") == message_body
+            and bool(prior_early.get("expect_reply")) == bool(expect_reply)
+            and prior_early["result"].get("target_session_id") == target_arg
+        ):
+            return _json({**prior_early["result"], "replayed": True})
+
     try:
         resolved, candidates = store.resolve_target(
         home,
@@ -989,6 +1037,16 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 "message": "This request_id is already being delivered. Retry after it finishes.",
             })
         if prior is None:
+            # Capacity is decided before the claim. Evicting the oldest entry here used to drop an
+            # unknown or still-running submit, and the cap only ran after success, so a run of
+            # unknown results grew without bound (R5-D01).
+            if not _make_room_for_operation():
+                return _json({
+                    "ok": False,
+                    "error": "operation_capacity",
+                    "request_id": send_token,
+                    "message": "Too many deliveries are still unconfirmed. Retry once one of them settles.",
+                })
             # Claimed before delivery so a second caller with the same id waits on this one
             # instead of delivering beside it. A gateway retry keeps the record it already has.
             _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
@@ -1078,13 +1136,30 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     if routed and dormant_local:
         db_path = Path(home) / "state.db"
         if db_path.is_file():
-            con = store._connect_ro(db_path)
             try:
-                has_index = bool(store._column_names(con, "gateway_routing"))
-                sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
-            finally:
-                con.close()
-            if has_index and (sid_to_key or key_to_entry):
+                con = store._connect_ro(db_path)
+                try:
+                    has_index = bool(store._column_names(con, "gateway_routing"))
+                    sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
+                finally:
+                    con.close()
+            except sqlite3.OperationalError:
+                # The claim was taken and nothing was sent. Leaving it makes every later retry
+                # say request_in_flight forever (R5-D03). Release it and say the store failed.
+                with _LOCK:
+                    held = _OPERATIONS.get(send_token)
+                    if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
+                        _OPERATIONS.pop(send_token, None)
+                return _json({
+                    "ok": False,
+                    "error": "store_unavailable",
+                    "request_id": send_token,
+                    "message": "The session store could not be read after the send was claimed. Nothing was delivered. Retry.",
+                })
+            if has_index:
+                # An empty index used to count as a verified route, because the check only ran
+                # when one of the maps had rows. A stored session_key with nothing behind it is
+                # metadata, not a route (R5-D04).
                 route_key = resolved.get("session_key") or ""
                 if route_key not in key_to_entry and resolved["session_id"] not in sid_to_key:
                     routed = False
@@ -1102,8 +1177,21 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             mounted_dormant = True
 
     # A synthesized key that did not mount is not a route. Injecting it reports success for a
-    # message the gateway drops, so it never happens (D03).
+    # message the gateway drops, so it never happens (D03). An empty routing index is the same
+    # case: the stored key is metadata until something confirms it (R5-D04).
     injectable = routed or mounted_dormant
+    if not injectable:
+        with _LOCK:
+            held = _OPERATIONS.get(send_token)
+            if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
+                _OPERATIONS.pop(send_token, None)
+        return _json({
+            "ok": False,
+            "error": "route_unverified",
+            "request_id": send_token,
+            "target_session_id": resolved["session_id"],
+            "message": "No confirmed route exists for this session. The stored session_key is metadata, not a route.",
+        })
     # A gateway retry skips inject. The first submit already resumed the session, so inject would
     # be a second copy of a message the gateway still has under this request_id (R3-01).
     skip_inject = _classic_cli_host(ctx) or not injectable or ws_retry
@@ -1230,19 +1318,13 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         ),
     }
     with _LOCK:
-        if len(_OPERATIONS) >= _OPERATION_MAX:
-            evicted = next(iter(_OPERATIONS))
-            _OPERATIONS.pop(evicted, None)
-            # The receipt belongs to the operation. Leaving it lets a later reuse of the same
-            # request_id read the previous outcome (R4-STATIC).
-            _RECEIPT_STATUS.pop(evicted, None)
-            _RECEIPT_OUTCOME.pop(evicted, None)
-            _RECEIPT_REFERENCE.pop(evicted, None)
         _OPERATIONS[send_token] = {
             "payload_hash": payload_hash,
             "delivered": True,
             "delivery_method": delivery_method,
             "envelope": payload,
+            "body": message_body,
+            "expect_reply": bool(expect_reply),
             "result": result,
         }
     return _json(result)
