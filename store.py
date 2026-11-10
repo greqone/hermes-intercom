@@ -714,6 +714,7 @@ def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key)
         "_cron": row_source.strip().lower() == "cron" or sid.startswith("cron_"),
         "_active": ended_at is None or ended_at == "",
         "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
+        "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
     }
 
 
@@ -736,6 +737,11 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
         if "id" not in colset:
             return None
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
         clauses = ["lower(id) = ?"]
         params: list[Any] = [text.lower()]
         if "session_key" in colset:
@@ -803,6 +809,11 @@ def _scan_title_and_prefix(
             return [], []
         sid_to_key, _entries = _load_routing_map(con, home)
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
         clauses: list[str] = []
         params: list[Any] = []
         if want_prefix and _store_looks_like_id(needle_low):

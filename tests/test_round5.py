@@ -130,6 +130,14 @@ def test_r5_d02_compression_rotation_replays_the_same_operation(tmp_path) -> Non
     assert retry["ok"] is True and retry.get("replayed") is True
     assert len(ctx.injected) == 1
 
+    by_key = _send(
+        ctx, target="agent:main:local:dm:local-target-0001", message="hello", request_id="same-op"
+    )
+    assert by_key["ok"] is True and by_key.get("replayed") is True, by_key
+    by_title = _send(ctx, target="Target", message="hello", request_id="same-op")
+    assert by_title["ok"] is True and by_title.get("replayed") is True, by_title
+    assert len(ctx.injected) == 1
+
 
 def test_r5_d02_a_later_hop_does_not_hide_an_accepted_result(tmp_path) -> None:
     home, ctx = _pair(tmp_path)
