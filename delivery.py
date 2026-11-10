@@ -487,7 +487,9 @@ def submit_via_gateway_ws(
                             status = str(receipt.get("status") or "admitted")
                             outcome = receipt.get("outcome")
                             reference = receipt.get("ref")
-                            if reference is None:
+                            if isinstance(reference, dict):
+                                reference = reference.get("session_id") or ""
+                            if not reference:
                                 reference = receipt.get("reference") or ""
                             if request_id:
                                 with _LOCK:

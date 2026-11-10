@@ -361,3 +361,39 @@ def test_r5_b02_another_session_does_not_inherit_the_replay(tmp_path) -> None:
                   caller="local-caller-0002")
     assert other.get("replayed") is not True
     assert other["error"] == "request_conflict"
+
+
+def test_r5_a02_a_host_ref_object_stays_a_session_id(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "session.resume":
+                return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+            return {"admission_id": "adm-1", "status": "queued", "outcome": None,
+                    "ref": {"profile_id": "default", "session_id": "local-target-0001"}}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    result = _send(ctx, target="local-target-0001", message="hello", request_id="ref-1")
+    assert result["ok"] is True
+    assert result["reference"] == "local-target-0001"
