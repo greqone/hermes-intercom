@@ -573,11 +573,12 @@ def _message_text(user_message: Any) -> str:
     return ""
 
 
-def _same_operation_target(record: dict[str, Any], target_arg: str) -> bool:
+def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id: str = "") -> bool:
     """The retry names the same conversation the first call resolved, however it spelled it.
 
-    A prefix of at least six characters counts: that is the length the resolver itself treats as
-    an id prefix, and a retry that uses one must not be sent to the gateway a second time.
+    A prefix counts only once it has been resolved, and only when that resolution is the same
+    session. Matching the spelling alone would replay a longer session for a retry whose shorter
+    text is another session's exact id.
     """
     result = record.get("result") or {}
     spellings = [
@@ -588,14 +589,8 @@ def _same_operation_target(record: dict[str, Any], target_arg: str) -> bool:
     ]
     if target_arg in spellings:
         return True
-    needle = target_arg.lower()
-    if len(needle) < store.MIN_ID_PREFIX_LEN:
-        return False
-    # A prefix matches only the id of the conversation the first call resolved. Matching the key or
-    # the title would replay one session's result for a retry that names a different one. A shorter
-    # stored id is not a prefix of a longer retry, so this never matches a different session.
     session_id = (result.get("target_session_id") or "").lower()
-    return bool(session_id) and session_id.startswith(needle)
+    return bool(session_id) and resolved_id.lower() == session_id
 
 
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
@@ -911,22 +906,6 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "error": "invalid_request_id",
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
-    if supplied_request:
-        with _LOCK:
-            prior_early = _OPERATIONS.get(supplied_request)
-        if (
-            prior_early is not None
-            and prior_early.get("delivered")
-            and prior_early.get("body") == message_body
-            and bool(prior_early.get("expect_reply")) == bool(expect_reply)
-            and prior_early["result"].get("from_session_id") == caller_sid
-            and (
-                prior_early.get("delivery_method") != "gateway_ws"
-                or prior_early["result"].get("status") == "terminal"
-            )
-            and _same_operation_target(prior_early, target_arg)
-        ):
-            return _json({**prior_early["result"], "replayed": True})
 
     try:
         resolved, candidates = store.resolve_target(
@@ -970,6 +949,23 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 "target_session_id": resolved["session_id"],
             }
         )
+
+    if supplied_request:
+        with _LOCK:
+            prior_early = _OPERATIONS.get(supplied_request)
+        if (
+            prior_early is not None
+            and prior_early.get("delivered")
+            and prior_early.get("body") == message_body
+            and bool(prior_early.get("expect_reply")) == bool(expect_reply)
+            and prior_early["result"].get("from_session_id") == caller_sid
+            and (
+                prior_early.get("delivery_method") != "gateway_ws"
+                or prior_early["result"].get("status") == "terminal"
+            )
+            and _same_operation_target(prior_early, target_arg, resolved["session_id"])
+        ):
+            return _json({**prior_early["result"], "replayed": True})
 
     target_key = resolved["session_key"]
     if not target_key:

@@ -411,6 +411,36 @@ def test_r6_a_prefix_retry_does_not_replay_a_different_session(tmp_path, monkeyp
     assert retry.get("error") == "request_conflict", retry
 
 
+def test_r6_a_shorter_exact_id_does_not_replay_a_longer_session(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-target-0001aaaa", "local", "m", None, 1.0, None, None, 1, "Longer", 0,
+         "agent:main:local:dm:local-target-0001aaaa", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-target-0001aaaa", '{"session_id": "local-target-0001aaaa"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001aaaa", message="hello", request_id="gw-short")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="gw-short")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("error") == "request_conflict", retry
+
+
 def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
     home = _home(tmp_path)
     key = "agent:main:local:dm:local-a"
@@ -430,15 +460,13 @@ def test_r6_a_nested_carrier_keeps_the_outer_card(tmp_path) -> None:
     plugin = _load_plugin()
     card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
     inner = (
-        "[PRIOR CONTEXT — for reference only; not a new message]\nold turn\n\n"
+        "[PRIOR CONTEXT — for reference only; not a new message]\n" + card + "\n\n"
         "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
         "[CONTEXT COMPACTION — REFERENCE ONLY] older\n\n"
         "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
     )
     nested = (
-        "[PRIOR CONTEXT — for reference only; not a new message]\n" + inner + "\n\n"
-        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
-        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] " + inner + "\n\n"
         "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
         + card
     )
