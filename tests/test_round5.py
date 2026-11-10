@@ -314,6 +314,73 @@ def test_r5_d05_b_a_late_queued_reply_does_not_keep_the_terminal_outcome(tmp_pat
     assert (stored_status, stored_outcome) in (("queued", ""), ("terminal", "cancelled")), (stored_status, stored_outcome)
 
 
+def test_r6_two_gateway_retries_do_not_both_submit(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
+    seed = _send(ctx, target="local-target-0001", message="hello", request_id="ws-overlap")
+    assert seed["error"] == "delivery_unknown"
+
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    returned: dict[str, dict] = {}
+
+    def _ws(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            release.wait(5)
+        return True, "adm-overlap"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+
+    def _call(slot: str) -> None:
+        try:
+            returned[slot] = _send(ctx, target="local-target-0001", message="hello", request_id="ws-overlap")
+        except BaseException as exc:
+            returned[slot] = {"error": repr(exc)}
+
+    first = threading.Thread(target=_call, args=("first",))
+    first.start()
+    assert entered.wait(3), returned
+    _call("second")
+    release.set()
+    first.join(5)
+    assert not first.is_alive()
+    assert calls["n"] == 1, (calls, returned)
+    assert returned["second"].get("error") == "request_in_flight", returned
+
+
+def test_r6_a_queued_gateway_send_is_not_evicted(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _queued(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "queued"
+        return True, "adm-queued"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _queued)
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
+    first = _send(ctx, target="local-target-0001", message="hold me", request_id="queued-op")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+
+    ctx._allow_inject = True
+    for n in range(3):
+        _send(ctx, target="local-target-0001", message=f"filler {n}", request_id=f"filler-{n}")
+    assert "queued-op" in plugin.delivery._OPERATIONS
+    before = len(ctx.injected)
+    retry = _send(ctx, target="local-target-0001", message="hold me", request_id="queued-op")
+    assert retry["delivery_method"] == "gateway_ws", retry
+    assert len(ctx.injected) == before
+
+
 # --- R5-S01: a reset ends the old conversation -----------------------------
 
 def test_r5_s01_idle_and_daily_endings_are_not_targets(tmp_path) -> None:

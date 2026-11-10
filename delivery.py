@@ -569,11 +569,12 @@ def _message_text(user_message: Any) -> str:
     return ""
 
 
-def _operation_is_live(record: dict[str, Any]) -> bool:
-    """A delivered inject can be dropped. An in-flight claim and an unconfirmed gateway
-    submit cannot: the first may still be sending, the second may already have landed."""
-    if record.get("delivery_method") == "gateway_ws" and not record.get("delivered"):
-        return True
+def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
+    """A delivered inject can be dropped. A gateway send stays until its receipt is terminal:
+    queued, started and unknown may still land, so forgetting them lets the same request id
+    deliver a second copy through inject_message."""
+    if record.get("delivery_method") == "gateway_ws":
+        return _RECEIPT_STATUS.get(token) != "terminal" or not record.get("delivered")
     return not record.get("delivered") and not record.get("result")
 
 
@@ -581,7 +582,7 @@ def _make_room_for_operation() -> bool:
     """Drop finished operations until one slot is free. Live ones stay. Returns False when
     every slot holds work that is still in doubt, so the caller must refuse instead."""
     while len(_OPERATIONS) >= _OPERATION_MAX:
-        finished = next((token for token, record in _OPERATIONS.items() if not _operation_is_live(record)), None)
+        finished = next((token for token, record in _OPERATIONS.items() if not _operation_is_live(record, token)), None)
         if finished is None:
             return False
         _OPERATIONS.pop(finished, None)
@@ -1030,6 +1031,17 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         # dedups on this request_id. Taking inject_message would land a second copy when the
         # first submit had already reached the peer (R3-01, R4-D01).
         ws_retry = prior is not None and prior.get("delivery_method") == "gateway_ws"
+        # A gateway retry used to skip the in-flight claim, so two retries of one request id
+        # both submitted (R6). The claim lasts for this call and is dropped when it returns.
+        if prior is not None and prior.get("_inflight"):
+            return _json({
+                "ok": False,
+                "error": "request_in_flight",
+                "request_id": send_token,
+                "message": "This request_id is already being delivered. Retry after it finishes.",
+            })
+        if ws_retry:
+            prior["_inflight"] = True
         # An unfinished claim blocks only while this call is still inside the function. A returned
         # delivery_unknown drops the claim, so this branch is the overlapping caller (R3-02).
         if prior is not None and not prior.get("delivered") and not ws_retry:
@@ -1228,6 +1240,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         in_flight = _ws_error_in_flight(ws_err)
         if not in_flight:
             with _LOCK:
+                held = _OPERATIONS.get(send_token)
+                if held is not None:
+                    held.pop("_inflight", None)
                 remaining = [
                     entry
                     for entry in _RECENT_SENDS.get(bucket_key, [])
@@ -1248,6 +1263,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             # drop the in-flight bit, so the retry the message asks for is not request_in_flight
             # and does not switch to inject_message (R3-02, R4-D01).
             with _LOCK:
+                held = _OPERATIONS.get(send_token)
+                if held is not None:
+                    held.pop("_inflight", None)
                 prior_op = _OPERATIONS.get(send_token) or {}
                 _OPERATIONS[send_token] = {
                     "payload_hash": prior_op.get("payload_hash", payload_hash),
@@ -1322,6 +1340,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         ),
     }
     with _LOCK:
+        held = _OPERATIONS.get(send_token)
+        if held is not None:
+            held.pop("_inflight", None)
         _OPERATIONS[send_token] = {
             "payload_hash": payload_hash,
             "delivered": True,
