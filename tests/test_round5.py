@@ -406,3 +406,23 @@ def test_r4_d06_a_refused_send_forgets_its_bucket_horizon(tmp_path) -> None:
     result = _send(ctx, target="local-target-0001", message="nope")
     assert result["ok"] is False
     assert plugin.delivery._BUCKET_HORIZON == {}
+
+
+def test_r5_s01_a_reset_rows_title_is_not_a_target(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-old", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Historical topic", 0, "", 2.0),
+        ("local-new", "local", "m", None, 3.0, None, None, 1, "New topic", 0, "", 4.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:telegram:dm:chat", '{"session_id": "local-new"}'),
+    )
+    con.commit()
+    con.close()
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "Historical topic", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []

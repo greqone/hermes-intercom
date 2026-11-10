@@ -932,9 +932,12 @@ def resolve_target(
 
     # Tier 2 - unique id/root-id prefix of at least MIN_ID_PREFIX_LEN characters.
     if prefix_hits:
-        if len(prefix_hits) == 1:
-            return prefix_hits[0], []
-        narrowed = [s for s in prefix_hits if not s.get("_archived") and not s.get("_cron")]
+        reset_free = [s for s in prefix_hits if s.get("_end_reason") not in _RESET_END_REASONS]
+        if not reset_free:
+            return None, []
+        if len(reset_free) == 1:
+            return reset_free[0], []
+        narrowed = [s for s in reset_free if not s.get("_archived") and not s.get("_cron")]
         # S-R03: an ended reset row and the live child that keeps its route are one conversation.
         # Two live rows that share a prefix stay ambiguous.
         by_key: dict[str, list[dict[str, Any]]] = {}
@@ -958,7 +961,8 @@ def resolve_target(
         pool = [
             s
             for s in non_cron
-            if s["title"]
+            if s.get("_end_reason") not in _RESET_END_REASONS
+            and s["title"]
             and (
                 _same_title(s["title"].strip(), needle)
                 if exact
