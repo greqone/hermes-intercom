@@ -591,7 +591,11 @@ def _same_operation_target(record: dict[str, Any], target_arg: str) -> bool:
     needle = target_arg.lower()
     if len(needle) < store.MIN_ID_PREFIX_LEN:
         return False
-    return any(item.lower().startswith(needle) for item in spellings if item)
+    # A prefix matches only the id of the conversation the first call resolved. Matching the key or
+    # the title would replay one session's result for a retry that names a different one. A shorter
+    # stored id is not a prefix of a longer retry, so this never matches a different session.
+    session_id = (result.get("target_session_id") or "").lower()
+    return bool(session_id) and session_id.startswith(needle)
 
 
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:

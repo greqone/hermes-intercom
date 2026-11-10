@@ -1055,7 +1055,7 @@ def _unwrap_carrier(text: str) -> str:
     reading the wrapped string finds no leading card, so an exhausted chain sends again at hop 1.
     """
     marker = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
-    if marker in text:
+    if marker in text and text.rsplit(marker, 1)[1].strip():
         return text.rsplit(marker, 1)[1].strip()
     if "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]" in text:
         head, _tail = text.rsplit("[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]", 1)

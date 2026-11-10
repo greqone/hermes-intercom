@@ -381,6 +381,36 @@ def test_r6_a_gateway_retry_by_prefix_does_not_submit_again(tmp_path, monkeypatc
     assert calls["n"] == 1
 
 
+def test_r6_a_prefix_retry_does_not_replay_a_different_session(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-target-0001aaaa", "local", "m", None, 1.0, None, None, 1, "Other", 0,
+         "agent:main:local:dm:local-target-0001aaaa", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-target-0001aaaa", '{"session_id": "local-target-0001aaaa"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-other")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001aaaa", message="hello", request_id="gw-other")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("error") == "request_conflict", retry
+
+
 def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
     home = _home(tmp_path)
     key = "agent:main:local:dm:local-a"
@@ -765,13 +795,15 @@ def test_r6_a_merged_carrier_keeps_the_exhausted_hop(tmp_path) -> None:
     con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
     con.executemany(
         "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
-        "VALUES ('local-caller-0001', 'user', ?, ?, 1, NULL)",
-        [(prior, 1.0), (leading, 2.0)],
+        "VALUES (?, 'user', ?, ?, 1, NULL)",
+        [("local-caller-0001", prior, 1.0), ("local-caller-0002", leading, 2.0)],
     )
     con.commit()
     con.close()
-    result = _send(ctx, target="local-target-0001", message="hello")
+    result = _send(ctx, target="local-target-0001", message="hello", caller="local-caller-0001")
     assert result["ok"] is False and result["error"] == "max_hops_exceeded", result
+    again = _send(ctx, target="local-target-0001", message="hello", caller="local-caller-0002")
+    assert again["ok"] is False and again["error"] == "max_hops_exceeded", again
 
 
 def test_r6_a_genuine_ask_after_the_summary_renews_the_budget(tmp_path) -> None:
