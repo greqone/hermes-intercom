@@ -441,6 +441,36 @@ def test_r6_a_shorter_exact_id_does_not_replay_a_longer_session(tmp_path, monkey
     assert retry.get("error") == "request_conflict", retry
 
 
+def test_r6_a_title_equal_to_another_sessions_id_does_not_replay_it(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-other-0009", "local", "m", None, 1.0, None, None, 1, "local-target-0001", 0,
+         "agent:main:local:dm:local-other-0009", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-other-0009", '{"session_id": "local-other-0009"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-other-0009", message="hello", request_id="gw-title")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="gw-title")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("target_session_id") != "local-other-0009"
+
+
 def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
     home = _home(tmp_path)
     key = "agent:main:local:dm:local-a"

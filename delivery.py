@@ -573,24 +573,28 @@ def _message_text(user_message: Any) -> str:
     return ""
 
 
-def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id: str = "") -> bool:
-    """The retry names the same conversation the first call resolved, however it spelled it.
+def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id: str = "",
+                          resolved_root: str = "") -> bool:
+    """The retry names the same conversation the first call resolved.
 
-    A prefix counts only once it has been resolved, and only when that resolution is the same
-    session. Matching the spelling alone would replay a longer session for a retry whose shorter
-    text is another session's exact id.
+    The text the caller typed counts only together with the session it resolves to. A title that
+    happens to equal another session's id must not replay the wrong one. A compression child keeps
+    its parent's root, so that root counts as the same conversation.
     """
     result = record.get("result") or {}
+    session_id = (result.get("target_session_id") or "").lower()
+    same = resolved_id.lower() == session_id or (
+        bool(resolved_root) and resolved_root.lower() == session_id
+    )
+    if not session_id or not same:
+        return False
     spellings = [
         record.get("target_text") or "",
         result.get("target_session_id") or "",
         result.get("target_title") or "",
         result.get("target_session_key") or "",
     ]
-    if target_arg in spellings:
-        return True
-    session_id = (result.get("target_session_id") or "").lower()
-    return bool(session_id) and resolved_id.lower() == session_id
+    return target_arg in spellings or session_id.startswith(target_arg.lower())
 
 
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
@@ -963,7 +967,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 prior_early.get("delivery_method") != "gateway_ws"
                 or prior_early["result"].get("status") == "terminal"
             )
-            and _same_operation_target(prior_early, target_arg, resolved["session_id"])
+            and _same_operation_target(
+                prior_early, target_arg, resolved["session_id"], resolved.get("root_session_id") or ""
+            )
         ):
             return _json({**prior_early["result"], "replayed": True})
 
