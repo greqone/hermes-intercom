@@ -154,8 +154,10 @@ def test_r6_a_a_request_id_does_not_replay_across_two_homes(tmp_path) -> None:
 def test_r6_a_a_receipt_does_not_cross_two_homes(tmp_path, monkeypatch) -> None:
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
+    (tmp_path / "c").mkdir()
     home_a, ctx_a = _pair(tmp_path / "a")
     home_b, ctx_b = _pair(tmp_path / "b")
+    home_c, ctx_c = _pair(tmp_path / "c")
     for ctx in (ctx_a, ctx_b):
         ctx._allow_inject = False
         ctx.allow_gateway_injection = True
@@ -164,20 +166,22 @@ def test_r6_a_a_receipt_does_not_cross_two_homes(tmp_path, monkeypatch) -> None:
 
     def _receipt(*_a, **kwargs):
         home = str(kwargs.get("home") or _a[0])
-        plugin.delivery._RECEIPT_STATUS[(home, kwargs["request_id"])] = "terminal"
-        plugin.delivery._RECEIPT_OUTCOME[(home, kwargs["request_id"])] = "cancelled" if home == homes["a"] else "completed"
+        status = "started" if home == homes["a"] else "terminal"
+        key = (home, kwargs["request_id"])
+        plugin.delivery._RECEIPT_STATUS[key] = status
+        plugin.delivery._RECEIPT_OUTCOME[key] = ""
+        plugin.delivery._RECEIPT_REFERENCE[key] = "ref-" + status
         return True, "adm-1"
 
     monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _receipt)
     first = _send(ctx_a, target="local-target-0001", message="hello", request_id="cross-home")
-    assert first["ok"] is True and first.get("outcome") == "cancelled", first
+    assert first["ok"] is True and first.get("status") == "started", first
     second = _send(ctx_b, target="local-target-0001", message="hello", request_id="cross-home")
-    assert second["ok"] is True, second
-    assert second.get("outcome") != "cancelled", second
-    ctx_b._allow_inject = True
-    third = _send(ctx_b, target="local-target-0001", message="by inject", request_id="cross-home-inject")
+    assert second["ok"] is True and second.get("status") == "terminal", second
+    third = _send(ctx_c, target="local-target-0001", message="hello", request_id="cross-home")
     assert third["ok"] is True and third["delivery_method"] == "inject_message", third
-    assert third.get("outcome") != "cancelled", third
+    assert third.get("status") == "scheduled", third
+    assert third.get("reference") in (None, ""), third
 
 
 def test_r5_d02_a_later_hop_does_not_hide_an_accepted_result(tmp_path) -> None:
