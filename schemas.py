@@ -49,8 +49,11 @@ SESSION_SEND_SCHEMA: dict = {
     "name": "session_send",
     "description": (
         "Send a message to another Hermes session in the same profile (by session_id, prefix, session_key, "
-        "or unique title substring). Wakes an idle target session as a new turn or queues into the target's "
-        "durable FIFO if busy. Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
+        "or unique title substring). Wakes an idle target session as a new turn or, when the target is "
+        "busy, hands the message to the host scheduler. The result says `scheduled` when the host "
+        "accepted it for scheduling. The gateway WebSocket fallback returns the host's own receipt "
+        "status: `queued`, `started`, `unknown` or `terminal`. Neither is a durable queue and neither promises the turn will run. "
+        "Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
         "loop protection so two sessions can exchange a bounded reply without infinite ping-pong."
     ),
     "parameters": {
@@ -75,6 +78,19 @@ SESSION_SEND_SCHEMA: dict = {
             "sender_label": {
                 "type": "string",
                 "description": "Optional short sender label override (defaults to this session's title and short ID).",
+            },
+            "request_id": {
+                "type": "string",
+                "description": (
+                    "Optional retry identity, 1-1024 characters. While retained, reuse the request_id, "
+                    "body and exact target_session_id from the first result: an inject retry replays "
+                    "the outcome; a gateway retry uses the gateway admission identity. A changed body "
+                    "conflicts. State is process-local, bounded to 4096 entries. Non-active gateway "
+                    "entries older than 120 seconds can be evicted under capacity pressure; completed "
+                    "entries are also evictable. After eviction or restart, check target history before "
+                    "resending because transport identity may be lost. This is not an exactly-once guarantee. "
+                    "Omit this only for genuinely new work."
+                ),
             },
         },
         "required": ["target", "message"],

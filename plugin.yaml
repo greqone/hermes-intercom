@@ -8,9 +8,12 @@ description: >
   synthesized agent:<ns>:local:dm:<id> key, auto-mounts dormant local
   (`:local:dm:`) sessions through the profile gateway authority when injection is
   refused, and for external processes falls back to `prompt.submit` over the
-  local Gateway WebSocket when `allow_gateway_injection: true`. Delivers
-  attributed agent cards through ctx.inject_message with multi-hop loop
-  protection and per-sender, expect_reply-aware deduplication.
+  local Gateway WebSocket when `allow_gateway_injection: true`. Delivers attributed agent cards through ctx.inject_message with multi-hop loop
+  protection and per-sender, expect_reply-aware deduplication. A classic CLI
+  host (a classic CLI REPL, detected from the host's own CLI reference) cannot honor a session_key, so delivery
+  falls back to the local gateway prompt.submit path instead of the sender's REPL.
+  The desktop half renders nothing: the SDK has no incoming-message slot and
+  catalog rule 8 forbids rewriting the host note.
 author: GreQ, Hermes Agent
 license: MIT
 requires_hermes: ">=0.22.5"
@@ -64,8 +67,5 @@ config_schema:
     minimum: 1.0
     maximum: 60.0
     description: >
-      Overall seconds budget for one gateway operation, not per step: gateway endpoint
-      discovery, session.resume and session.detach all share a single deadline for the
-      dormant mount, and the external-process WebSocket fallback (resume + prompt.submit +
-      detach) gets its own identical budget. A timed-out submit is treated as in-flight so
-      an immediate retry is not delivered twice.
+      Overall seconds budget shared by the dormant mount and the external-process WebSocket fallback.
+      A timed-out submit is treated as in-flight so an immediate retry is not delivered twice.

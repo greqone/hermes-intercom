@@ -1,0 +1,1210 @@
+"""Round 5 defects, written to fail on 3b2cf22.
+
+Each test states the behavior the repair must have. Exit codes here are the
+opposite of the defect probes: a failure means the defect is still present.
+Nothing in this file talks to a live gateway.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+import importlib.util
+import sys
+import pytest
+
+import hermes_cli.gateway_runtime as _gateway_runtime
+import hermes_cli.gateway_client as _gateway_client
+
+_SPEC = importlib.util.spec_from_file_location(
+    "_intercom_helpers", Path(__file__).resolve().parent / "test_intercom.py"
+)
+_HELPERS = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_HELPERS)
+RecordingContext = _HELPERS.RecordingContext
+_create_state_db = _HELPERS._create_state_db
+_load_plugin = _HELPERS._load_plugin
+
+
+def _home(tmp_path: Path) -> Path:
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _create_state_db(home / "state.db")
+    return home
+
+
+def _insert(home: Path, rows: list[tuple]) -> None:
+    con = sqlite3.connect(str(home / "state.db"))
+    for row in rows:
+        con.execute(
+            "INSERT INTO sessions (id, source, model, parent_session_id, started_at, "
+            "ended_at, end_reason, message_count, title, archived, session_key, last_activity_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+    con.commit()
+    con.close()
+
+
+def _send(ctx: RecordingContext, **kwargs) -> dict:
+    plugin = _load_plugin()
+    caller = str(kwargs.pop("caller", "local-caller-0001"))
+    raw = plugin.delivery.tool_session_send(kwargs, ctx=ctx, session_id=caller)
+    return json.loads(raw)
+
+
+def _pair(tmp_path: Path):
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-target-0001", "local", "m", None, 1.0, None, None, 1, "Target", 0,
+         "agent:main:local:dm:local-target-0001", 8.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-target-0001", '{"session_id": "local-target-0001"}'),
+    )
+    con.commit()
+    con.close()
+    return home, RecordingContext(home)
+
+
+# --- R5-D01: capacity must not throw away work that is still live ----------
+
+def test_r5_d01_full_buffer_refuses_new_work_instead_of_evicting_unknown(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
+
+    first = _send(ctx, target="local-target-0001", message="keep me", request_id="live-unknown")
+    assert first["error"] == "delivery_unknown"
+    _send(ctx, target="local-target-0001", message="filler", request_id="filler-1")
+
+    refused = _send(ctx, target="local-target-0001", message="one too many", request_id="new-one")
+    assert refused["ok"] is False and refused["error"] == "operation_capacity"
+    assert "live-unknown" in plugin.delivery._OPERATIONS
+
+    retry = _send(ctx, target="local-target-0001", message="keep me", request_id="live-unknown")
+    assert retry["error"] == "delivery_unknown"
+    assert ctx.injected == []
+
+
+def test_r5_d01_unknown_results_cannot_grow_past_the_cap(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
+
+    for n in range(3):
+        _send(ctx, target="local-target-0001", message=f"unknown {n}", request_id=f"unknown-{n}")
+    assert len(plugin.delivery._OPERATIONS) <= 2
+
+
+# --- R5-D02: a retry finds the operation it already sent -------------------
+
+def test_r5_d02_compression_rotation_replays_the_same_operation(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="same-op")
+    assert first["ok"] is True
+
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("UPDATE sessions SET ended_at=10, end_reason='compression' WHERE id='local-target-0001'")
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-child', 'local', 'm', 'local-target-0001', 11.0, NULL, NULL, 1, "
+        "'Target', 0, 'agent:main:local:dm:local-target-0001', 12.0)"
+    )
+    con.commit()
+    con.close()
+
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="same-op")
+    assert retry["ok"] is True and retry.get("replayed") is True
+    assert len(ctx.injected) == 1
+
+    by_key = _send(
+        ctx, target="agent:main:local:dm:local-target-0001", message="hello", request_id="same-op"
+    )
+    assert by_key["ok"] is True and by_key.get("replayed") is True, by_key
+    by_title = _send(ctx, target="Target", message="hello", request_id="same-op")
+    assert by_title["ok"] is True and by_title.get("replayed") is True, by_title
+    assert len(ctx.injected) == 1
+
+
+def test_r6_a_a_request_id_does_not_replay_across_two_homes(tmp_path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    home_a, ctx_a = _pair(tmp_path / "a")
+    home_b, ctx_b = _pair(tmp_path / "b")
+    first = _send(ctx_a, target="local-target-0001", message="hello", request_id="shared-id")
+    assert first["ok"] is True
+    second = _send(ctx_b, target="local-target-0001", message="hello", request_id="shared-id")
+    assert second.get("replayed") is not True, second
+    assert len(ctx_b.injected) == 1
+
+
+def test_r6_a_a_receipt_does_not_cross_two_homes(tmp_path, monkeypatch) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "c").mkdir()
+    home_a, ctx_a = _pair(tmp_path / "a")
+    home_b, ctx_b = _pair(tmp_path / "b")
+    home_c, ctx_c = _pair(tmp_path / "c")
+    for ctx in (ctx_a, ctx_b):
+        ctx._allow_inject = False
+        ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    class _Client:
+        def __init__(self, home):
+            self.home = str(home)
+
+        async def rpc(self, method, **kwargs):
+            if method == "session.resume":
+                return {"session_id": kwargs["session_id"], "subscription_id": "sub-1"}
+            status = "started" if self.home == str(home_a) else "terminal"
+            return {"admission_id": "adm-1", "status": status, "reference": "ref-" + status}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    def _connect(**_kwargs):
+        return _Client(_kwargs.get("endpoint"))
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", lambda parts, attr: (
+        (lambda home, timeout: type("D", (), {"endpoint": str(home), "state": "ready"})()) if attr == "discover_gateway_endpoint" else _connect
+    ))
+    first = _send(ctx_a, target="local-target-0001", message="hello", request_id="cross-home")
+    assert first["ok"] is True and first.get("status") == "started", first
+    second = _send(ctx_b, target="local-target-0001", message="hello", request_id="cross-home")
+    assert second["ok"] is True and second.get("status") == "terminal", second
+    third = _send(ctx_c, target="local-target-0001", message="hello", request_id="cross-home")
+    assert third["ok"] is True and third["delivery_method"] == "inject_message", third
+    assert third.get("status") == "scheduled", third
+    assert third.get("reference") in (None, ""), third
+
+
+def test_r5_d02_a_later_hop_does_not_hide_an_accepted_result(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="same-op")
+    assert first["ok"] is True
+    plugin = _load_plugin()
+    plugin.delivery._TURN_HOP[(str(home), "local-caller-0001")] = (4, 3)
+
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="same-op")
+    assert retry["ok"] is True and retry.get("replayed") is True
+    assert len(ctx.injected) == 1
+
+
+# --- R5-D03: a read error after the claim must release it ------------------
+
+def test_r5_d03_a_routing_read_error_releases_the_unsent_claim(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    plugin = _load_plugin()
+    real = plugin.store._connect_ro
+    calls = {"n": 0}
+
+    def _flaky(path):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise sqlite3.OperationalError("fixture: database became unavailable after claim")
+        return real(path)
+
+    monkeypatch.setattr(plugin.store, "_connect_ro", _flaky)
+    try:
+        result = _send(ctx, target="local-target-0001", message="hello", request_id="db-error")
+    except sqlite3.OperationalError:
+        result = {"ok": False, "error": "escaped"}
+    assert result["ok"] is False and result["error"] == "store_unavailable"
+    assert "db-error" not in plugin.delivery._OPERATIONS
+
+    monkeypatch.undo()
+    again = _send(ctx, target="local-target-0001", message="hello", request_id="db-error")
+    assert again["ok"] is True
+    assert len(ctx.injected) == 1
+
+
+# --- R5-D04: an empty routing index is not proof of a route ----------------
+
+def test_r5_d03_a_retry_after_an_unknown_gateway_submit_is_not_stuck_in_flight(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *_a, **_k: (False, "connection_lost"))
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-unknown")
+    assert first["ok"] is False and first["error"] == "delivery_unknown", first
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    again = _send(ctx, target="local-target-0001", message="hello", request_id="gw-unknown")
+    assert again.get("error") != "request_in_flight", again
+    assert again["ok"] is True and again["delivery_method"] == "gateway_ws"
+
+
+def test_a_gateway_retry_that_loses_its_route_does_not_stay_in_flight(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *_a, **_k: (False, "connection_lost"))
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert first["error"] == "delivery_unknown", first
+
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("DELETE FROM gateway_routing")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(plugin.delivery, "mount_dormant_local_session", lambda *_a, **_k: (False, "no route"))
+
+    lost = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert lost["error"] == "route_unverified", lost
+    stuck = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert stuck.get("error") != "request_in_flight", stuck
+
+
+def test_r5_d04_an_empty_routing_index_is_not_a_verified_route(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("DELETE FROM gateway_routing")
+    con.commit()
+    con.close()
+
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is False
+    assert result["error"] == "route_unverified"
+    assert ctx.injected == []
+
+
+# --- R5-D05: one receipt, not a collage of three maps ----------------------
+
+@pytest.mark.skip(reason="the in-flight claim stops a second caller, so this never produces two receipts")
+def test_r5_d05_a_queued_receipt_does_not_inherit_a_cancelled_outcome(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    receipts = [
+        {"admission_id": "adm-1", "status": "terminal", "outcome": "cancelled", "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "queued", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "session.resume":
+                return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+            return receipts.pop(0)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    runtime = _gateway_runtime
+    client_mod = _gateway_client
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    import threading
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
+    seed = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-race")
+    assert seed["error"] == "delivery_unknown"
+    plugin.delivery._OPERATIONS["receipt-race"]["delivered"] = True
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    entered = threading.Event()
+    release = threading.Event()
+    order = {"n": 0}
+    returned: dict[str, dict] = {}
+
+    real_rpc = _Client.rpc
+
+    async def rpc(self, method, **kwargs):
+        if method == "prompt.submit":
+            order["n"] += 1
+            if order["n"] == 1:
+                entered.set()
+                release.wait(5)
+        return await real_rpc(self, method, **kwargs)
+
+    monkeypatch.setattr(_Client, "rpc", rpc)
+
+    def _call(slot: str) -> None:
+        try:
+            returned[slot] = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-race")
+        except BaseException as exc:
+            returned[slot] = {"error": repr(exc)}
+
+    first_thread = threading.Thread(target=_call, args=("first",))
+    first_thread.start()
+    assert entered.wait(3), returned
+    _call("second")
+    release.set()
+    first_thread.join(5)
+    assert not first_thread.is_alive()
+
+    terminal = returned["second"]
+    queued = returned["first"]
+    assert terminal.get("admission_status") == "terminal", terminal
+    assert queued.get("admission_status") == "queued", queued
+    assert queued.get("outcome") in (None, ""), queued
+    assert terminal.get("outcome") == "cancelled", terminal
+    stored = plugin.delivery._RECEIPT_OUTCOME.get("receipt-race")
+    assert stored != "cancelled" or queued.get("outcome") != "cancelled"
+
+
+def test_r5_d05_b_a_late_queued_reply_does_not_keep_the_terminal_outcome(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "queued", "outcome": None, "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "terminal", "outcome": "cancelled", "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-order")
+    second = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-order")
+    assert first.get("admission_status") == "queued", first
+    assert first.get("outcome") in (None, ""), first
+    assert second.get("admission_status") == "terminal", second
+    assert second.get("outcome") == "cancelled", second
+    assert plugin.delivery._RECEIPT_STATUS.get("receipt-order") == "terminal"
+    assert plugin.delivery._RECEIPT_OUTCOME.get("receipt-order") == "cancelled"
+
+
+def test_r6_a_late_queued_reply_does_not_erase_a_terminal_receipt(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "terminal", "outcome": "cancelled", "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "queued", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-back")
+    second = _send(ctx, target="local-target", message="hello", request_id="receipt-back")
+    assert first.get("admission_status") == "terminal", first
+    assert second.get("admission_status") == "terminal", second
+    assert plugin.delivery._RECEIPT_STATUS.get("receipt-back") == "terminal"
+    assert plugin.delivery._RECEIPT_OUTCOME.get("receipt-back") == "cancelled"
+
+
+def test_r6_a_late_queued_reply_does_not_erase_a_started_receipt(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "started", "outcome": None, "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "queued", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-started")
+    second = _send(ctx, target="local-target", message="hello", request_id="receipt-started")
+    assert first.get("admission_status") == "started", first
+    assert second.get("admission_status") == "started", second
+
+
+def test_r6_an_unknown_receipt_is_reported_as_unknown(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    replies = [
+        {"admission_id": "adm-1", "status": "started", "outcome": None, "ref": {"profile_id": "default"}},
+        {"admission_id": "adm-1", "status": "unknown", "outcome": None, "ref": {"profile_id": "default"}},
+    ]
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            if method == "prompt.submit":
+                return replies.pop(0)
+            return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-unknown")
+    second = _send(ctx, target="local-target", message="hello", request_id="receipt-unknown")
+    assert first.get("admission_status") == "started", first
+    assert second.get("admission_status") == "unknown", second
+
+
+def test_r6_a_gateway_retry_by_prefix_does_not_submit_again(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls = {"n": 0}
+
+    def _ok(*_a, **kwargs):
+        calls["n"] += 1
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-prefix")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    retry = _send(ctx, target="local-target", message="hello", request_id="gw-prefix")
+    assert retry.get("replayed") is True, retry
+    assert calls["n"] == 1
+
+
+def test_r6_a_prefix_retry_does_not_replay_a_different_session(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-target-0001aaaa", "local", "m", None, 1.0, None, None, 1, "Other", 0,
+         "agent:main:local:dm:local-target-0001aaaa", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-target-0001aaaa", '{"session_id": "local-target-0001aaaa"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-other")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001aaaa", message="hello", request_id="gw-other")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("error") == "request_conflict", retry
+
+
+def test_r6_a_shorter_exact_id_does_not_replay_a_longer_session(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-target-0001aaaa", "local", "m", None, 1.0, None, None, 1, "Longer", 0,
+         "agent:main:local:dm:local-target-0001aaaa", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-target-0001aaaa", '{"session_id": "local-target-0001aaaa"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001aaaa", message="hello", request_id="gw-short")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="gw-short")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("error") == "request_conflict", retry
+
+
+def test_r6_a_title_equal_to_another_sessions_id_does_not_replay_it(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    _insert(home, [
+        ("local-other-0009", "local", "m", None, 1.0, None, None, 1, "local-target-0001", 0,
+         "agent:main:local:dm:local-other-0009", 7.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:local:dm:local-other-0009", '{"session_id": "local-other-0009"}'),
+    )
+    con.commit()
+    con.close()
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-other-0009", message="hello", request_id="gw-title")
+    assert first["ok"] is True
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id="gw-title")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("target_session_id") != "local-other-0009"
+
+
+def test_r6_a_retry_after_a_reset_does_not_replay_the_old_session(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    key = "agent:main:local:dm:local-target-0001"
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-reset")
+    assert first["ok"] is True
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("UPDATE sessions SET ended_at=10, end_reason='session_reset' WHERE id='local-target-0001'")
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-next', 'local', 'm', NULL, 11.0, NULL, NULL, 1, 'Next', 0, ?, 12.0)",
+        (key,),
+    )
+    con.commit()
+    con.close()
+    retry = _send(ctx, target=key, message="hello", request_id="gw-reset")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("target_session_id") != "local-target-0001"
+
+
+def test_r6_a_a_reset_then_a_compression_does_not_replay_the_old_session(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    key = "agent:main:local:dm:local-target-0001"
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="reset-then-compress")
+    assert first["ok"] is True
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("UPDATE sessions SET ended_at=10, end_reason='session_reset' WHERE id='local-target-0001'")
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-next', 'local', 'm', 'local-target-0001', 11.0, 13.0, 'compression', 1, "
+        "'Next', 0, ?, 12.0)",
+        (key,),
+    )
+    con.execute(
+        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, title, archived, session_key, last_activity_at) "
+        "VALUES ('local-target-grandchild', 'local', 'm', 'local-target-next', 14.0, NULL, NULL, 1, "
+        "'Next', 0, ?, 15.0)",
+        (key,),
+    )
+    con.commit()
+    con.close()
+    retry = _send(ctx, target=key, message="hello", request_id="reset-then-compress")
+    assert retry.get("replayed") is not True, retry
+    assert retry.get("target_session_id") != "local-target-0001"
+
+
+def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-a"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, "session_reset", 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == [], (resolved, ambiguous)
+
+
+def test_r6_a_literal_nested_summary_quote_has_no_leading_live_envelope(tmp_path) -> None:
+    home = _home(tmp_path)
+    plugin = _load_plugin()
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    inner = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\n" + card + "\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] older\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    nested = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] " + inner + "\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
+        + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, display_kind) "
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, NULL)",
+        (nested,),
+    )
+    con.commit()
+    con.close()
+    # This literal nested-summary quotation has no leading live envelope.
+    # Its abbreviated prefix and absent host metadata do not establish a host carrier projection.
+    assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (0, 0)
+
+
+def test_r6_two_gateway_retries_do_not_both_submit(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
+    seed = _send(ctx, target="local-target-0001", message="hello", request_id="ws-overlap")
+    assert seed["error"] == "delivery_unknown"
+
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    returned: dict[str, dict] = {}
+
+    def _ws(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            release.wait(5)
+        return True, "adm-overlap"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
+
+    def _call(slot: str) -> None:
+        try:
+            returned[slot] = _send(ctx, target="local-target-0001", message="hello", request_id="ws-overlap")
+        except BaseException as exc:
+            returned[slot] = {"error": repr(exc)}
+
+    first = threading.Thread(target=_call, args=("first",))
+    first.start()
+    assert entered.wait(3), returned
+    _call("second")
+    release.set()
+    first.join(5)
+    assert not first.is_alive()
+    assert calls["n"] == 1, (calls, returned)
+    assert returned["second"].get("error") == "request_in_flight", returned
+
+
+def test_r6_a_queued_gateway_send_is_not_evicted(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _queued(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "queued"
+        return True, "adm-queued"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _queued)
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
+    first = _send(ctx, target="local-target-0001", message="hold me", request_id="queued-op")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+
+    ctx._allow_inject = True
+    for n in range(3):
+        _send(ctx, target="local-target-0001", message=f"filler {n}", request_id=f"filler-{n}")
+    assert "queued-op" in plugin.delivery._OPERATIONS
+    before = len(ctx.injected)
+    retry = _send(ctx, target="local-target-0001", message="hold me", request_id="queued-op")
+    assert retry["delivery_method"] == "gateway_ws", retry
+    assert len(ctx.injected) == before
+
+
+def test_queued_gateway_sends_fill_the_operation_table(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 3)
+    def _queued(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "queued"
+        return True, "adm"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _queued)
+    outcomes = [
+        _send(ctx, target="local-target-0001", message=f"m{n}", request_id=f"q-{n}")
+        for n in range(5)
+    ]
+    assert all(row["ok"] is True and row["status"] == "queued" for row in outcomes[:3]), outcomes[:3]
+    assert outcomes[3]["error"] == "operation_capacity", outcomes[3]
+    assert outcomes[4]["error"] == "operation_capacity", outcomes[4]
+    for record in plugin.delivery._OPERATIONS.values():
+        record["claimed_at"] = time.monotonic() - 121.0
+    later = _send(ctx, target="local-target-0001", message="afterwards", request_id="q-later")
+    assert later["ok"] is True, later
+
+
+def test_r6_a_gateway_retry_replays_before_the_hop_check(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-replay")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    calls = {"n": 0}
+
+    def _counting(*_a, **_k):
+        calls["n"] += 1
+        return True, "adm-2"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _counting)
+    retry = _send(ctx, target="Target", message="hello", request_id="gw-replay")
+    assert retry.get("replayed") is True, retry
+    assert calls["n"] == 0
+
+
+def test_a_retry_of_a_minted_request_id_does_not_deliver_twice(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    plugin = _load_plugin()
+    first = _send(ctx, target="local-target-0001", message="hello")
+    assert first["ok"] is True, first
+    minted = first["request_id"]
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id=minted)
+    assert retry.get("replayed") is True, retry
+    assert len(ctx.injected) == 1
+
+
+def test_r6_a_retry_by_a_title_fragment_or_other_case_does_not_submit_again(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    calls = {"n": 0}
+
+    def _ok(*_a, **kwargs):
+        calls["n"] += 1
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-title-case")
+    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
+    plugin.delivery._TURN_HOP[(str(_home), "local-caller-0001")] = (4, 3)
+    for spelling in ("Targ", "TARGET"):
+        retry = _send(ctx, target=spelling, message="hello", request_id="gw-title-case")
+        assert retry.get("replayed") is True, (spelling, retry)
+    assert calls["n"] == 1
+
+
+# --- R5-S01: a reset ends the old conversation -----------------------------
+
+def test_r5_s01_idle_and_daily_endings_are_not_targets(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-old-idle", "local", "m", None, 1.0, 2.0, "idle", 1, "Old", 0,
+         "agent:main:local:dm:local-old-idle", 2.0),
+        ("local-old-daily", "local", "m", None, 1.0, 2.0, "daily", 1, "Old", 0,
+         "agent:main:local:dm:local-old-daily", 2.0),
+    ])
+    plugin = _load_plugin()
+    for target in ("local-old-idle", "local-old-daily"):
+        resolved, ambiguous = plugin.store.resolve_target(home, target, caller_session_id="local-caller-0001")
+        assert resolved is None and ambiguous == [], target
+
+
+# --- R5-S02: the host persists one summary column, not two -----------------
+
+def test_r5_s02_a_summary_row_does_not_reset_the_hop_budget(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary) "
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, 0)",
+        (card,),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES ('local-caller-0001', 'user', 'summary of the earlier turns', 2.0, 1, 'hidden')"
+    )
+    con.commit()
+    con.close()
+
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is False and result["error"] == "max_hops_exceeded"
+
+
+def test_r5_s02_an_inactive_row_cannot_hide_the_active_card(tmp_path) -> None:
+    home = _home(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN active INTEGER DEFAULT 1")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?,?,?,?,?)",
+        ("local-caller-0001", "user", "Current genuine human request", 1.0, 1),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?,?,?,?,?)",
+        ("local-caller-0001", "user", card, 2.0, 0),
+    )
+    con.commit()
+    con.close()
+
+    plugin = _load_plugin()
+    assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (0, 0)
+
+
+def test_r5_a_compressed_ancestor_does_not_resolve_to_an_archived_child(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "compression", 1, "Old", 0,
+         "agent:main:local:dm:local-old", 2.0),
+        ("local-child", "local", "m", "local-old", 3.0, 4.0, None, 1, "Child", 1,
+         "agent:main:local:dm:local-child", 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-old", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []
+
+
+def test_r5_b03_an_auto_closed_continuation_still_resolves(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "compression", 1, "Old", 0,
+         "agent:main:local:dm:local-old", 2.0),
+        ("local-child", "local", "m", "local-old", 3.0, 4.0, "tui_shutdown", 1, "Child", 0,
+         "agent:main:local:dm:local-child", 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, _ambiguous = plugin.store.resolve_target(home, "local-old", caller_session_id="local-caller-0001")
+    assert resolved is not None and resolved["session_id"] == "local-child"
+
+
+def test_r5_b02_another_session_does_not_inherit_the_replay(tmp_path) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="shared-id")
+    assert first["ok"] is True
+
+    other = _send(ctx, target="local-target-0001", message="hello", request_id="shared-id",
+                  caller="local-caller-0002")
+    assert other.get("replayed") is not True
+    assert other["error"] == "request_conflict"
+
+
+def test_r5_a02_a_host_ref_object_stays_a_session_id(tmp_path, monkeypatch) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+
+    seen = {"n": 0}
+
+    class _Client:
+        async def rpc(self, method, **_kwargs):
+            seen["n"] += 1
+            if method == "session.resume":
+                return {"session_id": "local-target-0001", "subscription_id": "sub-1"}
+            return {"admission_id": "adm-1", "status": "queued", "outcome": None,
+                    "ref": {"profile_id": "default", "session_id": "local-target-0001"}}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Discovery:
+        endpoint = "ws://127.0.0.1:9"
+        state = "ready"
+
+    def _attr(parts, name):
+        if name == "discover_gateway_endpoint":
+            return lambda *_a, **_k: _Discovery()
+        if name == "connect_gateway":
+            return lambda **_k: _Client()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin.delivery, "_load_core_attr", _attr)
+    result = _send(ctx, target="local-target-0001", message="hello", request_id="ref-1")
+    assert result["ok"] is True
+    assert seen["n"] > 0, result
+    assert result["reference"] == "local-target-0001"
+
+
+def test_r4_d06_a_refused_send_forgets_its_bucket_horizon(tmp_path) -> None:
+    _home_unused, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    plugin = _load_plugin()
+    result = _send(ctx, target="local-target-0001", message="nope")
+    assert result["ok"] is False
+    assert plugin.delivery._BUCKET_HORIZON == {}
+
+
+def test_r5_s01_a_reset_rows_title_is_not_a_target(tmp_path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-old", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Historical topic", 0, "", 2.0),
+        ("local-new", "local", "m", None, 3.0, None, None, 1, "New topic", 0, "", 4.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:telegram:dm:chat", '{"session_id": "local-new"}'),
+    )
+    con.commit()
+    con.close()
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "Historical topic", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []
+
+
+def test_r5_s01_a_reset_stops_the_compression_line(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, "session_reset", 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []
+
+
+def test_r5_s01_a_reset_rows_prefix_does_not_reach_its_successor(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-oldroot"
+    _insert(home, [
+        ("local-caller-0001", "local", "m", None, 1.0, None, None, 1, "Caller", 0,
+         "agent:main:local:dm:local-caller-0001", 9.0),
+        ("local-oldroot", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("local-newlive", "local", "m", None, 3.0, None, None, 1, "New", 0, key, 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-oldro", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == []
+
+
+# The host's boundary set, copied from hermes_state_common.py. A compression line must not
+# cross any of them. session_reset, idle and daily are already covered above.
+_HOST_BOUNDARY_REASONS = ("session_switch", "suspended", "resume_pending_expired", "new_session")
+
+
+@pytest.mark.parametrize("reason", _HOST_BOUNDARY_REASONS)
+def test_r6_a_host_boundary_reason_stops_the_compression_line(tmp_path, reason) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-a", "local", "m", None, 1.0, 2.0, "compression", 1, "A", 0, key, 2.0),
+        ("local-b", "local", "m", "local-a", 3.0, 4.0, reason, 1, "B", 0, key, 4.0),
+        ("local-c", "local", "m", "local-b", 5.0, 6.0, "compression", 1, "C", 0, key, 6.0),
+        ("local-d", "local", "m", "local-c", 7.0, None, None, 1, "D", 0, key, 8.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-a", caller_session_id="local-caller-0001")
+    assert resolved is None and ambiguous == [], reason
+
+
+def test_r6_a_shared_key_does_not_cross_a_reset(tmp_path) -> None:
+    home = _home(tmp_path)
+    key = "agent:main:local:dm:local-root"
+    _insert(home, [
+        ("local-old", "local", "m", None, 1.0, 2.0, "session_reset", 1, "Old", 0, key, 2.0),
+        ("local-new", "local", "m", None, 3.0, None, None, 1, "New", 0, key, 4.0),
+    ])
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, key, caller_session_id="local-caller-0001")
+    assert resolved is not None and resolved["session_id"] == "local-new", (resolved, ambiguous)
+
+
+def test_r6_a_merged_carrier_keeps_the_exhausted_hop(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    prior = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\n" + card
+        + "\n\n[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    leading = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
+        + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES (?, 'user', ?, ?, 1, NULL)",
+        [("local-caller-0001", prior, 1.0), ("local-caller-0002", leading, 2.0)],
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello", caller="local-caller-0001")
+    assert result["ok"] is False and result["error"] == "max_hops_exceeded", result
+    again = _send(ctx, target="local-target-0001", message="hello", caller="local-caller-0002")
+    assert again["ok"] is False and again["error"] == "max_hops_exceeded", again
+
+
+def test_r6_a_genuine_ask_after_the_summary_renews_the_budget(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    merged = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\nPlease send a fresh update.\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] " + card + "\n\n"
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER DEFAULT 0")
+    con.execute("ALTER TABLE messages ADD COLUMN display_kind TEXT")
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, _compressed_summary, display_kind) "
+        "VALUES ('local-caller-0001', 'user', ?, 1.0, 1, NULL)",
+        (merged,),
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is True and result["hop"] == 1, result
+
+
+def test_r6_an_inflight_restatement_keeps_the_exhausted_hop(tmp_path) -> None:
+    home, ctx = _pair(tmp_path)
+    card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
+    restated = (
+        "[STILL IN PROGRESS — this is the active request, restated after the "
+        "compaction boundary because it was not finished yet. Continue it; do not "
+        "start over.]\n" + card
+    )
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
+        ("local-caller-0001", restated, 1.0),
+    )
+    con.commit()
+    con.close()
+    result = _send(ctx, target="local-target-0001", message="hello")
+    assert result["ok"] is False and result["error"] == "max_hops_exceeded", result

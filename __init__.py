@@ -9,6 +9,43 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _frontmatter_scalar(raw: str) -> Any:
+    """One unquoted YAML scalar or an inline ``[a, b]`` list. Nested blocks are not scalars."""
+    text = raw.strip()
+    if not text or text in {">", "|", ">-", "|-"}:
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1]
+    if text.startswith("[") and text.endswith("]"):
+        parts = [part.strip().strip("'\"") for part in text[1:-1].split(",")]
+        return [part for part in parts if part]
+    if text in {"true", "false"}:
+        return text == "true"
+    if text in {"null", "~"}:
+        return None
+    return text
+
+
+def _frontmatter_stdlib(block: str) -> dict[str, Any]:
+    """Top-level ``key: value`` pairs when PyYAML is not installed.
+
+    A skill's name and description are flat scalars. Nested maps (``metadata:``) need PyYAML;
+    without it those keys are omitted rather than registered as an empty description.
+    """
+    parsed: dict[str, Any] = {}
+    for line in block.splitlines():
+        if not line.strip() or line[:1].isspace() or line.lstrip().startswith("#"):
+            continue
+        key, sep, raw = line.partition(":")
+        if not sep or not key.strip():
+            continue
+        value = _frontmatter_scalar(raw)
+        if value is None and raw.strip() in {"", ">", "|", ">-", "|-"}:
+            continue
+        parsed[key.strip()] = value
+    return parsed
+
+
 def _read_skill_frontmatter(skill_md: Path) -> dict[str, Any]:
     """Parse the YAML frontmatter block at the top of ``SKILL.md``; ``{}`` when absent/invalid."""
     try:
@@ -26,13 +63,15 @@ def _read_skill_frontmatter(skill_md: Path) -> dict[str, Any]:
             break
     if end is None:
         return {}
+    block = "\n".join(lines[1:end])
     try:
         import yaml
 
-        parsed = yaml.safe_load("\n".join(lines[1:end]))
+        parsed = yaml.safe_load(block)
     except Exception:
-        logger.debug("hermes-intercom: SKILL.md frontmatter unparsable", exc_info=True)
-        return {}
+        # PyYAML is not a declared dependency. Flat skill fields still have to register.
+        logger.debug("hermes-intercom: SKILL.md frontmatter fell back to stdlib", exc_info=True)
+        parsed = _frontmatter_stdlib(block)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -82,6 +121,10 @@ def register(ctx) -> None:
         **common,
     )
     ctx.register_hook("pre_llm_call", lambda **kw: delivery.on_pre_llm_call(ctx=ctx, **kw))
+    try:
+        ctx.on_unload(delivery.shutdown_discovery_executor)
+    except Exception:
+        logger.debug("hermes-intercom: host has no on_unload", exc_info=True)
 
     try:
         skills_dir = Path(__file__).parent / "skills"

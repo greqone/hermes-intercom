@@ -11,10 +11,22 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_REPO = Path(
-    os.environ.get("HERMES_AGENT_REPO")
-    or (Path(os.path.expandvars("%LOCALAPPDATA%")) / "hermes" / "hermes-agent")
-)
+
+
+def _hermes_repo() -> Path:
+    """Host checkout: HERMES_AGENT_REPO, then the per-user install, then the POSIX default."""
+    candidates = [
+        os.environ.get("HERMES_AGENT_REPO") or "",
+        str(Path(os.environ.get("LOCALAPPDATA", "")) / "hermes" / "hermes-agent"),
+        str(Path.home() / ".hermes" / "hermes-agent"),
+    ]
+    for raw in candidates:
+        if raw and Path(raw).is_dir():
+            return Path(raw)
+    return Path(candidates[0] or ".")
+
+
+HERMES_REPO = _hermes_repo()
 
 
 def _seed_disposable_home(home: Path, *, allow_injection: bool) -> tuple[str, str]:
@@ -114,11 +126,20 @@ def _seed_disposable_home(home: Path, *, allow_injection: bool) -> tuple[str, st
         ],
     )
     con.commit()
+    for sid in (sid_a, sid_b):
+        con.execute(
+            "INSERT OR REPLACE INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+            (f"agent:main:local:dm:{sid}", json.dumps({"session_id": sid})),
+        )
+    con.commit()
     con.close()
     return sid_a, sid_b
 
 
-@pytest.mark.skipif(not HERMES_REPO.is_dir(), reason="Hermes core checkout not present")
+@pytest.mark.skipif(
+    not (HERMES_REPO / "hermes_cli").is_dir(),
+    reason="Hermes core checkout not present",
+)
 def test_real_plugin_manager_and_registry_dispatch_positive_and_negative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

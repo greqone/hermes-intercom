@@ -57,17 +57,38 @@ _SESSION_OPTIONAL_COLUMNS = (
 
 # End reasons that mark a session segment as a superseded compression ancestor.
 _COMPRESSED_END_REASONS = frozenset({"compression", "compressed"})
+# A row ended for any of these is a conversation the host will not resume. Naming it delivers into
+# the conversation that inherited its key while the result still quotes the old id (R5-S01).
+# The set is the host's own, from hermes_state_common.py: the reset reasons plus 'new_session',
+# which is how the CLI ends the predecessor on /new.
+_BOUNDARY_END_REASONS = frozenset({
+    "session_reset", "session_switch", "idle", "daily", "suspended",
+    "resume_pending_expired", "new_session",
+})
+_AUTOMATIC_END_REASONS = frozenset({
+    "agent_close", "ws_orphan_reap", "superseded_by_resume", "startup_orphan_reap",
+    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict",
+})
+
+
+
+class StoreReadError(RuntimeError):
+    """state.db exists but could not be read. Distinct from an empty result."""
 
 
 def resolve_home(ctx: Any = None) -> Path:
     """Resolve the Hermes home directory for this call.
 
-    Order: explicit ``ctx.home_path`` -> ``hermes_constants.get_hermes_home()`` (which already
-    honors the thread/async ContextVar override *and* ``HERMES_HOME``) -> a stripped and expanded
-    ``HERMES_HOME`` -> ``~/.hermes``.
+    Order: explicit ``ctx.home_path`` -> the host manager's home (``ctx._manager.home_path``,
+    which is where ``PluginContext`` actually keeps the profile) -> ``hermes_constants.get_hermes_home()``
+    (which already honors the thread/async ContextVar override *and* ``HERMES_HOME``) -> a stripped and
+    expanded ``HERMES_HOME`` -> ``~/.hermes``.
     """
     if ctx is not None:
         home = getattr(ctx, "home_path", None)
+        if home is None:
+            manager = getattr(ctx, "_manager", None)
+            home = getattr(manager, "home_path", None)
         if home is not None:
             text = str(home).strip()
             if text:
@@ -162,6 +183,10 @@ def _column_names(con: sqlite3.Connection, table: str) -> list[str]:
         return []
     try:
         rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.DatabaseError:
+        # A file that is not a database is a read failure, not a table that happens to
+        # have no columns. Callers turn this into store_unreadable instead of "no sessions".
+        raise
     except sqlite3.Error:
         return []
     names: list[str] = []
@@ -182,25 +207,37 @@ def _projection(columns: set[str], wanted: tuple[str, ...]) -> str:
     )
 
 
-def _connect_ro(db_path: Path) -> sqlite3.Connection:
-    """Open state.db read-only through a percent-encoded SQLite URI.
+def _sqlite_uri(db_path: Path) -> str:
+    """Percent-encoded ``file:`` URI for a read-only open of ``state.db``.
 
     Encoding keeps ``#``, ``%`` and ``?`` inside directory names from breaking the URI.
 
-    A UNC path needs a *four*-slash URI (``file:////server/share/db``): SQLite rejects any non-empty
-    authority (``file://server/...`` fails with ``invalid uri authority``), so the leading ``//`` of
-    the encoded UNC path is preceded by ``///`` to leave the authority empty.
+    A UNC path keeps its leading slashes (``resolve()`` would drop them on POSIX) and uses the
+    four-slash form SQLite opens on Windows. The five-slash form fails against a real share.
     """
-    try:
-        resolved = db_path.resolve()
-    except OSError:
-        resolved = db_path
-    posix = resolved.as_posix()
-    if posix.startswith("//"):
-        encoded = "///" + urllib.parse.quote(posix.lstrip("/"), safe="/:")
+    raw_posix = db_path.as_posix()
+    is_unc = raw_posix.startswith("//") or str(db_path).startswith("\\\\")
+    if is_unc:
+        # ``resolve()`` on POSIX collapses ``//server/share`` to ``/server/share``. Keep the UNC form,
+        # and keep the four slashes: on Windows SQLite the five-slash form fails to open a real
+        # ``\\localhost\c$`` share while four slashes opens it (measured 2026-11-09).
+        posix = raw_posix if raw_posix.startswith("//") else "//" + str(db_path).lstrip("\\").replace("\\", "/")
+        # ``file:`` plus ``////server`` is the four-slash form. ``as_posix()`` only keeps two, and
+        # ``file://server`` does not open a Windows share.
+        encoded = urllib.parse.quote("//" + posix, safe="/:")
     else:
+        try:
+            resolved = db_path.resolve()
+        except OSError:
+            resolved = db_path
+        posix = resolved.as_posix()
         encoded = urllib.parse.quote(posix, safe="/:")
-    con = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True, timeout=5.0)
+    return f"file:{encoded}?mode=ro"
+
+
+def _connect_ro(db_path: Path) -> sqlite3.Connection:
+    """Open state.db read-only through :func:`_sqlite_uri`."""
+    con = sqlite3.connect(_sqlite_uri(db_path), uri=True, timeout=5.0)
     con.row_factory = sqlite3.Row
     return con
 
@@ -254,7 +291,7 @@ def _load_routing_map(
         # authoritative comparison is the normcase/normpath check below.
         where = " WHERE (scope IS NULL OR scope = '' OR scope = ? COLLATE NOCASE)"
         params = (expected_scope,)
-    order = " ORDER BY COALESCE(updated_at, 0) ASC" if has_updated else ""
+    order = " ORDER BY COALESCE(updated_at, 0) DESC" if has_updated else ""
     sql = f"SELECT {', '.join(wanted)} FROM gateway_routing{where}{order} LIMIT 10000"
     try:
         rows = con.execute(sql, params).fetchall()
@@ -290,10 +327,10 @@ def _load_routing_map(
             except (sqlite3.Error, ValueError, TypeError):
                 entry = {}
         if isinstance(entry, dict):
-            key_to_entry[skey] = entry
+            key_to_entry.setdefault(skey, entry)
             sid = str(entry.get("session_id") or "")
             if sid:
-                sid_to_key[sid] = skey
+                sid_to_key.setdefault(sid, skey)
     return sid_to_key, key_to_entry
 
 
@@ -341,19 +378,62 @@ def query_sessions(
             return []
         sid_to_key, _key_to_entry = _load_routing_map(con, home)
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
+        order = ""
         if "last_activity_at" in colset and "started_at" in colset:
             order = " ORDER BY COALESCE(last_activity_at, started_at, 0) DESC"
         elif "last_activity_at" in colset:
             order = " ORDER BY COALESCE(last_activity_at, 0) DESC"
         elif "started_at" in colset:
             order = " ORDER BY COALESCE(started_at, 0) DESC"
-        else:
-            order = ""
+        # F10: subagents and cron rows used to fill the window before any filtering, so a busy
+        # profile returned an empty list. Exclude them in SQL; the Python pass stays as a backstop.
+        where_parts: list[str] = []
+        if q_norm or src_norm:
+            # Filter before LIMIT: unrelated recent sessions must not hide an old match.
+            # Python's Unicode lower agrees with the public matching pass, unlike SQLite lower.
+            def matches(sid, title, row_source, cwd, stored_key):
+                sid, title, row_source, cwd, stored_key = (
+                    str(value or "") for value in (sid, title, row_source, cwd, stored_key)
+                )
+                skey = sid_to_key.get(sid) or stored_key.strip()
+                if not skey and sid.startswith("local-"):
+                    skey = f"agent:{ns}:local:dm:{sid}"
+                if src_norm and row_source.strip().lower() != src_norm:
+                    return 0
+                return int(not q_norm or q_norm in " ".join(
+                    (sid, _root_from_key(skey), title, row_source, cwd, skey)
+                ).lower())
+            con.create_function("intercom_matches", 5, matches)
+            fields = [col if col in colset else "NULL" for col in ("id", "title", "source", "cwd", "session_key")]
+            where_parts.append(f"intercom_matches({', '.join(fields)}) = 1")
+        if "source" in colset:
+            excluded = "'subagent'" if include_cron else "'subagent', 'cron'"
+            where_parts.append(f"lower(COALESCE(source, '')) NOT IN ({excluded})")
+        if not include_cron:
+            where_parts.append("lower(id) NOT LIKE 'cron\\_%' ESCAPE '\\'")
+        if "title" in colset:
+            where_parts.append("COALESCE(title, '') NOT LIKE 'Subagent:%'")
+        if "end_reason" in colset:
+            # S-R05: a profile full of compression ancestors used to fill the window, so the
+            # older live session was read and then discarded. Exclude them before the LIMIT.
+            quoted = ", ".join(f"'{reason}'" for reason in sorted(_COMPRESSED_END_REASONS))
+            where_parts.append(f"lower(COALESCE(end_reason, '')) NOT IN ({quoted})")
+        if not include_archived:
+            if "archived" in colset:
+                where_parts.append("COALESCE(archived, 0) = 0")
+            if "hidden" in colset:
+                where_parts.append("COALESCE(hidden, 0) = 0")
+        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         rows = con.execute(
-            f"SELECT {select_list} FROM sessions{order} LIMIT ?", (sql_limit,)
+            f"SELECT {select_list} FROM sessions{where_sql}{order} LIMIT ?", (sql_limit,)
         ).fetchall()
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        raise StoreReadError(str(exc)) from exc
     finally:
         if con is not None:
             con.close()
@@ -383,7 +463,7 @@ def query_sessions(
         if not include_cron and msg_count == 0 and not title:
             continue
 
-        explicit_key = str(_row_get(r, "session_key") or "").strip() or sid_to_key.get(sid, "")
+        explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
         # ``routed`` tells delivery whether a real gateway route exists. A merely synthesized
         # ``:local:dm:`` key can pass core's admissibility check and be dropped asynchronously, so a
         # dormant mount must happen before injecting.
@@ -422,6 +502,8 @@ def query_sessions(
             "_archived": archived != 0 or hidden != 0,
             "_cron": is_cron,
             "_active": item_active,
+            "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
+            "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
         }
 
         dedup_key = skey or sid
@@ -466,112 +548,386 @@ def _root_from_key(skey: str) -> str:
     return text.rsplit(":", 1)[-1]
 
 
+_LINEAGE_MAX = 256
+
+
 def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
-    """``parent_session_id`` for ``sid`` ("" when unknown), never raising."""
+    """Compression parent; absence is empty, but read errors must reach the hop guard."""
     if not sid:
         return ""
-    try:
-        colset = {c.lower() for c in _column_names(con, "sessions")}
-        if "id" not in colset or "parent_session_id" not in colset:
-            return ""
-        row = con.execute(
-            "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1", (sid,)
-        ).fetchone()
-    except sqlite3.Error:
+    colset = {c.lower() for c in _column_names(con, "sessions")}
+    if "id" not in colset or "parent_session_id" not in colset:
         return ""
+    wanted = "parent_session_id"
+    if "source" in colset:
+        wanted += ", source"
+    if "end_reason" in colset:
+        wanted += ", (SELECT p.end_reason FROM sessions p WHERE p.id = sessions.parent_session_id) AS parent_end_reason"
+    if "model_config" in colset:
+        wanted += ", model_config"
+    row = con.execute(
+        f"SELECT {wanted} FROM sessions WHERE id = ? LIMIT 1", (sid,)
+    ).fetchone()
     if row is None:
         return ""
-    return str(_row_get(row, "parent_session_id") or "").strip()
+    if str(_row_get(row, "source") or "").strip().lower() in {"tool", "subagent"}:
+        return ""
+    parent = str(_row_get(row, "parent_session_id") or "").strip()
+    if "end_reason" in colset and str(_row_get(row, "parent_end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
+        return ""
+    if _is_branch_edge(_row_get(row, "model_config"), parent):
+        return ""
+    return parent
+
+
+def _is_branch_edge(model_config: Any, ancestor_id: str) -> bool:
+    """True when ``model_config`` records a branch/reset/delegate edge off ``ancestor_id``.
+
+    Compression continuations carry none of these markers, so a descendant without one stays a
+    candidate. A descendant with one is a different conversation and must not inherit the reply.
+    """
+    if not isinstance(model_config, str) or not model_config.strip():
+        return False
+    try:
+        parsed = json.loads(model_config)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    markers = ("_branched_from", "_reset_from", "_delegate_from")
+    return any(str(parsed.get(key) or "").strip().lower() == ancestor_id.lower() for key in markers)
+
+
+def compression_line(home: Path, resolved_id: str, stored_id: str) -> bool:
+    """True when ``resolved_id`` continues ``stored_id`` by compression alone.
+
+    Every link from the resolved session back to the stored one has to end by compression and carry
+    no branch, reset or delegate marker. One reset anywhere in that line makes it a different
+    conversation, so a retry must not replay the old result into it.
+    """
+    start = (resolved_id or "").strip().lower()
+    target = (stored_id or "").strip().lower()
+    if not start or not target or start == target:
+        return start == target and bool(start)
+    db_path = Path(home) / "state.db"
+    if not db_path.is_file():
+        return False
+    con: sqlite3.Connection | None = None
+    try:
+        con = _connect_ro(db_path)
+        colset = {c.lower() for c in _column_names(con, "sessions")}
+        if "id" not in colset or "parent_session_id" not in colset or "end_reason" not in colset:
+            return False
+        has_config = "model_config" in colset
+        current = start
+        seen: set[str] = set()
+        for _ in range(6):
+            if not current or current in seen:
+                return False
+            seen.add(current)
+            row = con.execute(
+                "SELECT parent_session_id"
+                + (", model_config" if has_config else "")
+                + ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                + " AS parent_end_reason FROM sessions WHERE lower(id) = ? LIMIT 1",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return False
+            parent = str(_row_get(row, "parent_session_id") or "").strip().lower()
+            reason = str(_row_get(row, "parent_end_reason") or "").strip().lower()
+            if reason not in _COMPRESSED_END_REASONS:
+                return False
+            if has_config and _is_branch_edge(_row_get(row, "model_config"), parent):
+                return False
+            if parent == target:
+                return True
+            current = parent
+        return False
+    except sqlite3.Error:
+        return False
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _same_title(left: str, right: str) -> bool:
+    """Unicode-aware equality. ``casefold`` folds Ż→ż and ß→ss; SQLite ``lower()`` folds neither."""
+    return left.casefold() == right.casefold()
+
+
+def _ancestor_descendants(
+    home: Path, needle_low: str, all_sessions: list[dict[str, Any]], *,
+    ns: str = "main", caller_session_id: str = "", caller_session_key: str = "",
+) -> list[dict[str, Any]]:
+    """Read the actual compression lineage, without route dedup or a recency window.
+
+    Only a parent ended by compression licenses a continuation edge. Reset/branch/
+    delegate markers and tool children end that path. Two live siblings stay two
+    candidates even when their routing keys are identical.
+    """
+    db_path = Path(home) / "state.db"
+    if not needle_low or not db_path.is_file():
+        return []
+    con: sqlite3.Connection | None = None
+    try:
+        con = _connect_ro(db_path)
+        colset = {c.lower() for c in _column_names(con, "sessions")}
+        if not {"id", "parent_session_id", "end_reason"} <= colset:
+            return []
+        wanted = _SESSION_OPTIONAL_COLUMNS + ("model_config",)
+        select_list = "id, " + _projection(colset, wanted)
+        ancestor = con.execute(
+            f"SELECT {select_list} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
+        ).fetchone()
+        if str(_row_get(ancestor, "end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
+            return []
+        sid_to_key, _entries = _load_routing_map(con, home)
+        frontier = [str(_row_get(ancestor, "id"))]
+        seen = {frontier[0].lower()}
+        candidates: list[dict[str, Any]] = []
+        while frontier:
+            next_frontier: list[str] = []
+            for parent in frontier:
+                for child in con.execute(
+                    f"SELECT {select_list} FROM sessions WHERE lower(parent_session_id) = ?", (parent.lower(),)
+                ):
+                    sid = str(_row_get(child, "id") or "")
+                    if not sid or sid.lower() in seen:
+                        continue
+                    seen.add(sid.lower())
+                    if len(seen) > _LINEAGE_MAX:
+                        raise StoreReadError("Compression lineage exceeds safe resolution bound")
+                    source = str(_row_get(child, "source") or "").strip().lower()
+                    if source in {"tool", "subagent"} or _is_branch_edge(_row_get(child, "model_config"), parent):
+                        continue
+                    reason = str(_row_get(child, "end_reason") or "").strip().lower()
+                    if reason in _COMPRESSED_END_REASONS:
+                        next_frontier.append(sid)
+                        continue
+                    if reason in _BOUNDARY_END_REASONS or reason == "branched":
+                        continue
+                    item = _row_to_session(child, sid_to_key, ns=ns, caller_session_id=caller_session_id, caller_session_key=caller_session_key)
+                    if item is not None and (item["_active"] or reason in _AUTOMATIC_END_REASONS) and not item["_archived"] and not item["_cron"]:
+                        candidates.append(item)
+            frontier = next_frontier
+        return candidates
+    except sqlite3.Error as exc:
+        raise StoreReadError(str(exc)) from exc
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _resolve_ancestor_alias(
     home: Path, needle_low: str, all_sessions: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
-    """Map an ended/compressed ancestor segment to the live continuation that replaced it.
+    """The single live continuation of an ended segment, or None when there is not exactly one."""
+    pool = _ancestor_descendants(home, needle_low, all_sessions)
+    if len(pool) == 1:
+        return pool[0]
+    return None
 
-    Walks down ``parent_session_id`` (five generations) from the named segment and also matches the
-    ancestor's ``session_key``, so replying to a pre-compression session id reaches the active
-    continuation instead of failing with ``target_not_found``.
+
+
+
+def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key):
+    """One sessions row as a resolvable item. None for subagents and compression ancestors."""
+    sid = str(_row_get(r, "id") or "")
+    if not sid:
+        return None
+    title = str(_row_get(r, "title") or "")
+    row_source = str(_row_get(r, "source") or "")
+    if row_source.strip().lower() == "subagent" or title.strip().startswith("Subagent:"):
+        return None
+    if str(_row_get(r, "end_reason") or "").strip().lower() in _COMPRESSED_END_REASONS:
+        return None
+    explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
+    routed = bool(explicit_key)
+    skey = explicit_key or (f"agent:{ns}:local:dm:{sid}" if sid.startswith("local-") else "")
+    root_sid = skey.rsplit(":", 1)[-1] if skey and ":local:dm:local-" in skey else sid
+    ended_at = _row_get(r, "ended_at")
+    last_active = _safe_float(_row_get(r, "last_activity_at"), 0.0) or _safe_float(_row_get(r, "started_at"), 0.0)
+    return {
+        "session_id": sid,
+        "root_session_id": root_sid,
+        "title": title,
+        "source": row_source,
+        "model": str(_row_get(r, "model") or ""),
+        "cwd": str(_row_get(r, "cwd") or ""),
+        "session_key": skey,
+        "message_count": _safe_int(_row_get(r, "message_count"), 0),
+        "last_activity_at": last_active,
+        "addressable": bool(skey),
+        "routed": routed,
+        "is_self": bool(
+            (caller_session_id and caller_session_id in (sid, root_sid))
+            or (caller_session_key and skey and skey == caller_session_key)
+        ),
+        "_archived": _safe_int(_row_get(r, "archived"), 0) != 0 or _safe_int(_row_get(r, "hidden"), 0) != 0,
+        "_cron": row_source.strip().lower() == "cron" or sid.startswith("cron_"),
+        "_active": ended_at is None or ended_at == "",
+        "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
+        "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
+    }
+
+
+def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
+                         caller_session_id: str = "", caller_session_key: str = "") -> dict[str, Any] | None:
+    """Resolve one exact session id or session_key with a single indexed read.
+
+    ``query_sessions`` only scans the most recent rows, so an old session would otherwise be
+    unreachable by the exact id its owner still has. Returns None for anything that is not an
+    exact match, leaving prefix and title resolution to the bounded scan.
     """
-    if not needle_low or not all_sessions:
-        return None
     db_path = Path(home) / "state.db"
-    if not db_path.is_file():
+    text = (needle or "").strip()
+    if not text or not db_path.is_file():
         return None
-
-    chain: list[str] = []
-    ancestor_key = ""
     con: sqlite3.Connection | None = None
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if "id" not in colset:
             return None
-        has_key = "session_key" in colset
-        has_parent = "parent_session_id" in colset
-        wanted = ["id"] + (["session_key"] if has_key else []) + (
-            ["parent_session_id"] if has_parent else []
-        )
+        select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
+        clauses = ["lower(id) = ?"]
+        params: list[Any] = [text.lower()]
+        if "session_key" in colset:
+            clauses.append("lower(COALESCE(session_key, '')) = ?")
+            params.append(text.lower())
+        order_terms: list[str] = []
+        if "ended_at" in colset:
+            order_terms.append("(ended_at IS NULL OR ended_at = '') DESC")
+        activity = [col for col in ("last_activity_at", "started_at") if col in colset]
+        if activity:
+            order_terms.append(f"COALESCE({', '.join(activity)}, 0) DESC")
+        order_sql = (" ORDER BY " + ", ".join(order_terms)) if order_terms else ""
+        sid_to_key, entries = _load_routing_map(con, home)
+        route_owner = next((str(entry.get("session_id") or "") for key, entry in entries.items()
+                            if key.lower() == text.lower()), "")
+        # Exact physical ids take precedence over route metadata. The route index can name an
+        # old owner outside the discovery window and sessions.session_key may be NULL.
         row = con.execute(
-            f"SELECT {', '.join(wanted)} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
+            f"SELECT {select_list} FROM sessions WHERE lower(id) = ? LIMIT 1", (text.lower(),)
         ).fetchone()
+        if row is None and route_owner:
+            row = con.execute(
+                f"SELECT {select_list} FROM sessions WHERE id = ? LIMIT 1", (route_owner,)
+            ).fetchone()
+        if row is None:
+            row = con.execute(
+                f"SELECT {select_list} FROM sessions WHERE {' OR '.join(clauses)}{order_sql} LIMIT 1",
+                tuple(params),
+            ).fetchone()
         if row is None:
             return None
-        ancestor_id = str(_row_get(row, "id") or "")
-        if not ancestor_id:
-            return None
-        ancestor_key = str(_row_get(row, "session_key") or "").strip()
-        chain = [ancestor_id.lower()]
-        frontier = [ancestor_id]
-        for _ in range(5):
-            if not has_parent or not frontier:
-                break
-            marks = ",".join("?" for _ in frontier)
-            child_rows = con.execute(
-                f"SELECT id FROM sessions WHERE lower(parent_session_id) IN ({marks})",
-                [item.lower() for item in frontier],
-            ).fetchall()
-            next_frontier: list[str] = []
-            for child in child_rows:
-                cid = str(_row_get(child, "id") or "")
-                if not cid or cid.lower() in chain:
-                    continue
-                chain.append(cid.lower())
-                next_frontier.append(cid)
-            frontier = next_frontier
+        built = _row_to_session(
+            row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
+            caller_session_key=caller_session_key,
+        )
     except sqlite3.Error:
         return None
     finally:
         if con is not None:
             con.close()
+    return built
 
-    by_sid = {s["session_id"].lower(): s for s in all_sessions}
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for cid in chain:
-        found = by_sid.get(cid)
-        if found is not None and cid not in seen:
-            candidates.append(found)
-            seen.add(cid)
-    for s in all_sessions:
-        sid_low = s["session_id"].lower()
-        if sid_low in seen:
-            continue
-        if ancestor_key and s["session_key"] == ancestor_key:
-            candidates.append(s)
-            seen.add(sid_low)
-        elif s["root_session_id"].lower() == needle_low:
-            candidates.append(s)
-            seen.add(sid_low)
 
-    candidates = [c for c in candidates if c["session_id"].lower() != needle_low]
-    if not candidates:
-        return None
-    live = [
-        c for c in candidates if not c.get("_archived") and not c.get("_cron") and c.get("_active", True)
-    ]
-    pool = live or candidates
-    return max(pool, key=lambda s: s["last_activity_at"])
+def _store_looks_like_id(needle_low: str) -> bool:
+    """True only for the id shapes this plugin resolves: ``local-``, ``cron_`` or a hex token.
+
+    A bare word such as a foreign title must not take the prefix path, because that path compares
+    bytes and skips casefolding.
+    """
+    if needle_low.startswith(("local-", "cron_")):
+        return True
+    return bool(re.fullmatch(r"[0-9a-f-]{16,}", needle_low))
+
+
+def _scan_title_and_prefix(
+    home: Path, needle: str, needle_low: str, *, ns: str, caller_session_id: str, caller_session_key: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Every active-or-not row whose id prefix or title matches ``needle``.
+
+    ``query_sessions`` stops at 10000 raw rows, so a second match past that window
+    would make the first look unique. This reads the whole table but only keeps
+    the rows that actually match, which for a title or a >=6-char prefix is small.
+    """
+    db_path = Path(home) / "state.db"
+    if not needle or not db_path.is_file():
+        return [], []
+    want_prefix = len(needle_low) >= MIN_ID_PREFIX_LEN
+    con: sqlite3.Connection | None = None
+    prefix_hits: list[dict[str, Any]] = []
+    title_hits: list[dict[str, Any]] = []
+    seen_prefix: set[str] = set()
+    seen_title: set[str] = set()
+    try:
+        con = _connect_ro(db_path)
+        colset = {c.lower() for c in _column_names(con, "sessions")}
+        if "id" not in colset:
+            return [], []
+        sid_to_key, _entries = _load_routing_map(con, home)
+        select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
+        if "parent_session_id" in colset and "end_reason" in colset:
+            select_list += (
+                ", (SELECT s2.end_reason FROM sessions s2 WHERE s2.id = sessions.parent_session_id)"
+                " AS parent_end_reason"
+            )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if want_prefix and _store_looks_like_id(needle_low):
+            escaped = needle_low.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("lower(id) LIKE ? ESCAPE '\\'")
+            params.append(escaped + "%")
+            if "session_key" in colset:
+                # root_session_id is the trailing segment of a ``:local:dm:`` key, so a prefix of it
+                # never matched a row whose own id differs (S04).
+                clauses.append("lower(COALESCE(session_key, '')) LIKE ? ESCAPE '\\'")
+                params.append("%:local:dm:" + escaped + "%")
+        if "title" in colset:
+            # No SQL predicate: SQLite lower() does not casefold Ż or ß, so the filter used to drop
+            # the uppercase title before Python ever ranked it (S02). A prefix predicate is worse:
+            # a title such as ``local-topic`` never matches ``lower(id) LIKE 'local-topic%'``, so
+            # the row was discarded before the title fold ran. Title matching reads the rows.
+            title_scan = True
+            clauses = []
+            params = []
+        else:
+            title_scan = False
+        if not clauses and not title_scan:
+            return [], []
+        where_sql = (" WHERE " + " OR ".join(clauses)) if clauses else ""
+        rows = con.execute(
+            f"SELECT {select_list} FROM sessions{where_sql}", tuple(params)
+        )
+        for row in rows:
+            built = _row_to_session(
+                row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
+                caller_session_key=caller_session_key,
+            )
+            if built is None:
+                continue
+            sid = built["session_id"]
+            if want_prefix and sid.lower().startswith(needle_low) and sid not in seen_prefix:
+                prefix_hits.append(built)
+                seen_prefix.add(sid)
+            title = built["title"]
+            if title and needle.casefold() in title.casefold() and sid not in seen_title:
+                title_hits.append(built)
+                seen_title.add(sid)
+    except sqlite3.Error as exc:
+        raise StoreReadError(str(exc)) from exc
+    finally:
+        if con is not None:
+            con.close()
+    return prefix_hits, title_hits
 
 
 def resolve_target(
@@ -585,17 +941,44 @@ def resolve_target(
     """Resolve a target string to one session (or an ambiguity list).
 
     Tiers, in order: exact session_id/root_session_id/session_key -> compressed ancestor alias ->
-    unique ``>=MIN_ID_PREFIX_LEN`` id prefix -> title (exact, then substring). An id prefix is never
-    beaten by a title, so a chat titled ``local-ab`` cannot hijack the prefix ``local-ab...``, and an
-    archived chat with the same title never blocks the active one.
+    unique ``>=MIN_ID_PREFIX_LEN`` id prefix -> title (exact, then substring). Prefix and title
+    matches come from the whole table, not the recency window, so a second match past that
+    window stays visible. An id prefix is never beaten by a title, so a chat titled ``local-ab``
+    cannot hijack the prefix ``local-ab...``, and an archived chat with the same title never
+    blocks the active one.
     """
     needle = (target or "").strip()
     if not needle:
         return None, []
     needle_low = needle.lower()
 
-    # Rank over a much wider window than the public session_list cap so older sessions
-    # remain resolvable by exact id/key, ID prefix, or title.
+    direct = lookup_exact_session(
+        home, needle, ns=ns, caller_session_id=caller_session_id,
+        caller_session_key=caller_session_key,
+    )
+    if direct is not None and needle_low in (
+        direct["session_id"].lower(), direct["root_session_id"].lower(), direct["session_key"].lower()
+    ):
+        # A row ended by session_reset keeps the key the live conversation now owns. Returning it
+        # makes the host dispatcher deliver into that new conversation while this result names the
+        # old id (S-R01). The ended id is not a target.
+        if str(direct.get("_end_reason") or "").strip().lower() in _BOUNDARY_END_REASONS:
+            return None, []
+        return direct, []
+
+    # Resolve physical compression edges before any route-key deduplication.
+    descendants = _ancestor_descendants(
+        home, needle_low, [], ns=ns, caller_session_id=caller_session_id,
+        caller_session_key=caller_session_key,
+    )
+    if len(descendants) == 1:
+        return descendants[0], []
+    if len(descendants) > 1:
+        return None, descendants[:8]
+
+    # Rank over a much wider window than the public session_list cap so the compression
+    # alias can still see the live continuation. Prefix and title resolution do not use
+    # this window: a second match past it would otherwise look unique.
     all_sessions = query_sessions(
         home,
         ns=ns,
@@ -608,11 +991,13 @@ def resolve_target(
         _with_internal=True,
     )
 
-    # Tier 1 - exact session id / root id / gateway session key.
+    # Tier 1 - exact session id / gateway session key. The root id is excluded on purpose:
+    # a descendant inherits its ancestor's root, so matching it here returns the live child of
+    # a conversation the host already ended (R6).
     exact_id = [
         s
         for s in all_sessions
-        if needle_low in (s["session_id"].lower(), s["root_session_id"].lower(), s["session_key"].lower())
+        if needle_low in (s["session_id"].lower(), s["session_key"].lower())
     ]
     if exact_id:
         if len(exact_id) == 1:
@@ -624,38 +1009,48 @@ def resolve_target(
             return active_exact[0], []
         return None, (active_exact or exact_id)[:8]
 
-    # Tier 1b - an ended/compressed segment id resolves to its live continuation.
-    alias = _resolve_ancestor_alias(home, needle_low, all_sessions)
-    if alias is not None:
-        return alias, []
+    prefix_hits, title_hits = _scan_title_and_prefix(
+        home, needle, needle_low, ns=ns, caller_session_id=caller_session_id,
+        caller_session_key=caller_session_key,
+    )
 
     # Tier 2 - unique id/root-id prefix of at least MIN_ID_PREFIX_LEN characters.
-    if len(needle_low) >= MIN_ID_PREFIX_LEN:
-        prefix_hits = [
-            s
-            for s in all_sessions
-            if s["session_id"].lower().startswith(needle_low)
-            or s["root_session_id"].lower().startswith(needle_low)
-        ]
-        if len(prefix_hits) == 1:
-            return prefix_hits[0], []
-        if prefix_hits:
-            narrowed = [s for s in prefix_hits if not s.get("_archived") and not s.get("_cron")]
-            if len(narrowed) == 1:
-                return narrowed[0], []
-            return None, (narrowed or prefix_hits)[:8]
+    if prefix_hits:
+        reset_free = [s for s in prefix_hits if s.get("_end_reason") not in _BOUNDARY_END_REASONS]
+        if not reset_free:
+            return None, []
+        if len(reset_free) == 1:
+            return reset_free[0], []
+        narrowed = [s for s in reset_free if not s.get("_archived") and not s.get("_cron")]
+        # S-R03: an ended reset row and the live child that keeps its route are one conversation.
+        # Two live rows that share a prefix stay ambiguous.
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for item in narrowed:
+            by_key.setdefault(item.get("session_key") or item["session_id"], []).append(item)
+        collapsed = []
+        for group in by_key.values():
+            live = [item for item in group if item.get("_active", True)]
+            ended = [item for item in group if not item.get("_active", True)]
+            if len(live) == 1 and ended:
+                collapsed.append(live[0])
+            else:
+                collapsed.extend(group)
+        if len(collapsed) == 1:
+            return collapsed[0], []
+        return None, (collapsed or prefix_hits)[:8]
 
     # Tier 3 - title: exact title first, then substring, active before archived, never cron.
-    non_cron = [s for s in all_sessions if not s.get("_cron")]
+    non_cron = [s for s in title_hits if not s.get("_cron")]
     for exact in (True, False):
         pool = [
             s
             for s in non_cron
-            if s["title"]
+            if s.get("_end_reason") not in _BOUNDARY_END_REASONS
+            and s["title"]
             and (
-                s["title"].strip().lower() == needle_low
+                _same_title(s["title"].strip(), needle)
                 if exact
-                else needle_low in s["title"].lower()
+                else needle.casefold() in s["title"].casefold()
             )
         ]
         if not pool:
@@ -735,34 +1130,67 @@ def lookup_sender_info(
     }
 
 
+def _unwrap_carrier(text: str) -> str:
+    """The live part of a merged compression carrier, or the text itself when it is not one.
+
+    The host folds a summary into a carried row two ways (agent/context_compressor.py): the prior
+    context leads and the summary follows the delimiter, or the summary leads and the live text
+    follows the end marker. Either way the card that decides the hop sits outside the summary, and
+    reading the wrapped string finds no leading card, so an exhausted chain sends again at hop 1.
+    """
+    marker = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    stripped = text.lstrip()
+    # Delimiters inside an ordinary card or human quotation are body text, not host structure.
+    header = "[PRIOR CONTEXT — for reference only; not a new message]"
+    if stripped.startswith(header):
+        live, sep, _summary = stripped[len(header):].partition(
+            "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+        )
+        return live.strip() if sep else text
+    if stripped.startswith("[CONTEXT COMPACTION — REFERENCE ONLY]") and marker in stripped:
+        # Match the host projector: a later literal marker belongs to the live body.
+        return stripped.split(marker, 1)[1].strip()
+    return text
+
+
 def parse_intercom_tag(text: str | None) -> tuple[int, int]:
     """Return ``(hop, sender_max_hops)`` for the inbound intercom card in ``text``.
 
-    The card must be the first thing in the message, or - when a queued prompt was prepended in
-    front of it - start its own line; the highest hop found wins, so a prepended prompt can never
-    lower the loop counter.
+    The card must be the first thing in the message, or — when a queued prompt was prepended in
+    front of it — start its own line. The first card found is the envelope. A later card is the body
+    quoting one, so it never raises the hop or lowers the sender's budget.
+
+    The line fallback used to run ``^\\s*`` under ``re.MULTILINE``, which re-scans the whole tail at
+    every blank line. The walk below is one pass.
     """
     if not text or not isinstance(text, str):
         return 0, 0
+    text = _unwrap_carrier(text)
     m = INTERCOM_CARD_PREFIX_RE.match(text)
     if m is None:
         m = BARE_INTERCOM_TAG_RE.match(text)
     if m is not None:
-        try:
-            return max(0, int(m.group(2))), max(0, int(m.group(3)))
-        except (TypeError, ValueError):
-            return 0, 0
-    best_hop = 0
-    best_max = 0
-    for found in _INTERCOM_CARD_LINE_RE.finditer(text):
-        try:
-            hop = max(0, int(found.group(2)))
-            sender_max = max(0, int(found.group(3)))
-        except (TypeError, ValueError):
+        return _tag_ints(m)
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if not stripped:
             continue
-        if hop >= best_hop:
-            best_hop, best_max = hop, sender_max
-    return best_hop, best_max
+        if stripped.startswith("[Message from agent "):
+            found = _INTERCOM_CARD_LINE_RE.match(stripped)
+            return _tag_ints(found) if found is not None else (0, 0)
+        # Only a host queued-prompt marker may precede the card. Real text means the card is a quote.
+        if not stripped.startswith(("[Queued prompt", "[STILL IN PROGRESS")):
+            return 0, 0
+    return 0, 0
+
+
+def _tag_ints(match: re.Match[str] | None) -> tuple[int, int]:
+    if match is None:
+        return 0, 0
+    try:
+        return max(0, int(match.group(2))), max(0, int(match.group(3)))
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 def parse_hop_from_text(text: str | None) -> int:
@@ -770,47 +1198,75 @@ def parse_hop_from_text(text: str | None) -> int:
     return parse_intercom_tag(text)[0]
 
 
-def latest_user_message_hop(home: Path, session_id: str) -> int:
-    """Fallback hop reader: latest ``role='user'`` message for this segment, else its parents'.
+def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
+    """Fallback tag reader: ``(hop, sender_max_hops)`` of the latest user message.
+
+    ``(-1, 0)`` means the store could not be read, which is not an untagged turn.
 
     Right after context compression the caller's ``session_id`` is a fresh continuation segment
-    with no messages yet, so up to five ``parent_session_id`` hops are checked.
+    with no messages yet. Verified compression parents are checked up to a bounded limit;
+    exhaustion or a cycle fails closed.
     """
     sid = str(session_id or "").strip()
     if not sid:
-        return 0
+        return 0, 0
     db_path = Path(home) / "state.db"
     if not db_path.is_file():
-        return 0
+        return 0, 0
     con: sqlite3.Connection | None = None
     try:
         con = _connect_ro(db_path)
         msg_cols = {c.lower() for c in _column_names(con, "messages")}
         if "content" not in msg_cols or "session_id" not in msg_cols:
-            return 0
+            return 0, 0
         has_role = "role" in msg_cols
         order_col = "id" if "id" in msg_cols else ("timestamp" if "timestamp" in msg_cols else "rowid")
         current = sid
         seen: set[str] = set()
-        for _ in range(6):  # this segment, then up to five parent segments
-            if not current or current in seen:
-                break
+        for _ in range(_LINEAGE_MAX):
+            if not current:
+                return 0, 0
+            if current in seen:
+                return -1, 0
             seen.add(current)
             where = "session_id = ?" + (" AND role = 'user'" if has_role else "")
+            # A pure compression summary is not a turn, so it must not hide the parent's card
+            # (S-R02). The host never stores _compressed_summary_has_user_turn: it hides a standalone
+            # summary with display_kind = 'hidden' (agent/session_persistence.py). A carrier that still
+            # holds a real user ask keeps its visibility, so skipping only the hidden rows keeps that ask.
+            if "display_kind" in msg_cols:
+                where += " AND COALESCE(display_kind, '') != 'hidden'"
+            elif "_compressed_summary" in msg_cols and "_compressed_summary_has_user_turn" in msg_cols:
+                where += (
+                    " AND (COALESCE(_compressed_summary, 0) = 0"
+                    " OR COALESCE(_compressed_summary_has_user_turn, 0) != 0)"
+                )
+            # A rewind leaves the withdrawn row in place with active=0. Reading it hides the card
+            # the host still shows (R5-S02). A store without the column keeps the old query.
+            if "active" in msg_cols:
+                where += " AND COALESCE(active, 1) = 1"
             row = con.execute(
                 f"SELECT content FROM messages WHERE {where} ORDER BY {order_col} DESC LIMIT 1",
                 (current,),
             ).fetchone()
             if row is not None:
                 # A real user turn (tagged or not) is authoritative for this segment.
-                return parse_hop_from_text(str(_row_get(row, "content") or ""))
+                return parse_intercom_tag(str(_row_get(row, "content") or ""))
             current = _parent_session_id(con, current)
+        # A truncated/cyclic history is unknown, never permission to restart at hop one.
+        return (-1, 0) if current else (0, 0)
     except sqlite3.Error:
-        return 0
+        return -1, 0
     finally:
         if con is not None:
             con.close()
-    return 0
+    return 0, 0
+
+
+def latest_user_message_hop(home: Path, session_id: str) -> int:
+    """Hop of the latest user message; 0 when the store is unreadable or the turn is untagged."""
+    hop, _max_hops = latest_user_message_tag(home, session_id)
+    return max(0, hop)
 
 
 def sanitize_card_sender(raw_label: str) -> str:
@@ -829,6 +1285,23 @@ def sanitize_card_sender(raw_label: str) -> str:
     return cleaned
 
 
+# The host expands these anywhere in the card, including the sender label
+# (agent/context_references.py). Built-ins are file/folder/git/url/diff/staged.
+# A registered provider is any @word:value the built-in pattern did not claim.
+_DIRECTIVE_RE = re.compile(
+    r"@+(file|folder|diff|git|url):|@+(diff|staged)\b|@+([a-zA-Z][a-zA-Z0-9_-]*):",
+    re.IGNORECASE,
+)
+
+
+def neutralize_directives(text: str) -> str:
+    """Break ``@file:`` and registered ``@kind:`` so the target session cannot expand them.
+
+    The readable value stays. Only the ``@`` that makes it a directive is removed.
+    """
+    return _DIRECTIVE_RE.sub(lambda m: (m.group(1) or m.group(2) or m.group(3) or "ref") + ":", text)
+
+
 def format_intercom_message(
     *,
     sender_card_name: str,
@@ -838,11 +1311,11 @@ def format_intercom_message(
     expect_reply: bool,
     message: str,
 ) -> str:
-    card_name = sanitize_card_sender(sender_card_name)
+    card_name = neutralize_directives(sanitize_card_sender(sender_card_name))
     safe_sid = re.sub(
         r"[\s\[\]]+", "", sanitize_utf8_text(str(sender_session_id or "unknown"))
     ) or "unknown"
-    safe_body = sanitize_utf8_text(str(message or "")).strip()
+    safe_body = neutralize_directives(sanitize_utf8_text(str(message or "")))
     mode = "reply" if expect_reply else "fyi"
     tag = f"[intercom from={safe_sid} hop={hop}/{max_hops} mode={mode}]"
     if expect_reply and hop < max_hops:
