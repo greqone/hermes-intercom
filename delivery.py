@@ -657,8 +657,13 @@ def _receipt(home: Any, request_id: str) -> tuple[str, str, str]:
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
     """A delivered inject can be dropped. A gateway send stays until its receipt is terminal:
     queued, started and unknown may still land, so forgetting them lets the same request id
-    deliver a second copy through inject_message."""
+    deliver a second copy through inject_message. A receipt that never arrives would hold its
+    slot forever and eventually refuse every new send, so one older than the dedup window is
+    treated as settled."""
     if record.get("delivery_method") == "gateway_ws":
+        claimed_at = float(record.get("claimed_at") or 0.0)
+        if claimed_at and (time.monotonic() - claimed_at) > 120.0:
+            return False
         receipt_id = (str(record.get("home") or ""), token[1] if isinstance(token, tuple) and len(token) > 1 else token)
         status, _outcome, _reference = _receipt(*receipt_id)
         return status != "terminal" or not record.get("delivered")
@@ -1117,7 +1122,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "error": "invalid_request_id",
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
-    send_token = (home_key, supplied_request) if supplied_request else ("", uuid.uuid4().hex)
+    send_token = (home_key, supplied_request) if supplied_request else (home_key, uuid.uuid4().hex)
     public_request = supplied_request or send_token[1]
     identity = "\n".join((
         str(resolved["session_id"]), target_key, caller_sid, str(bool(expect_reply)), message_body,
@@ -1179,7 +1184,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 })
             # Claimed before delivery so a second caller with the same id waits on this one
             # instead of delivering beside it. A gateway retry keeps the record it already has.
-            _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}}
+            _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}, "claimed_at": time.monotonic()}
         _remember_bucket_horizon(bucket_key, keep_win)
         _evict_stale_send_buckets(now_mono)
         history, retained = _recent_sends_for(bucket_key, now_mono, keep_win)
@@ -1280,6 +1285,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     held = _OPERATIONS.get(send_token)
                     if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
                         _OPERATIONS.pop(send_token, None)
+                    elif held is not None:
+                        held.pop("_inflight", None)
                 return _json({
                     "ok": False,
                     "error": "store_unavailable",
@@ -1315,6 +1322,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             held = _OPERATIONS.get(send_token)
             if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
                 _OPERATIONS.pop(send_token, None)
+            elif held is not None:
+                held.pop("_inflight", None)
         return _json({
             "ok": False,
             "error": "route_unverified",
@@ -1388,6 +1397,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     "delivery_method": "gateway_ws",
                     "envelope": payload,
                     "result": {},
+                    "claimed_at": (prior_op.get("claimed_at") or time.monotonic()),
                 }
         unknown = in_flight and bool(ws_err)
         result: dict[str, Any] = {
@@ -1468,6 +1478,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "expect_reply": bool(expect_reply),
             "target_text": target_arg,
             "home": home_key,
+            "claimed_at": (held.get("claimed_at") if held else None) or time.monotonic(),
             "result": result,
         }
     return _json(result)

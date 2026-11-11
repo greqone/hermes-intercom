@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import importlib.util
@@ -236,6 +237,47 @@ def test_r5_d03_a_routing_read_error_releases_the_unsent_claim(tmp_path, monkeyp
 
 
 # --- R5-D04: an empty routing index is not proof of a route ----------------
+
+def test_r5_d03_a_retry_after_an_unknown_gateway_submit_is_not_stuck_in_flight(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *_a, **_k: (False, "connection_lost"))
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-unknown")
+    assert first["ok"] is False and first["error"] == "delivery_unknown", first
+
+    def _ok(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
+        plugin.delivery._RECEIPT_OUTCOME[kwargs["request_id"]] = "completed"
+        return True, "adm-1"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ok)
+    again = _send(ctx, target="local-target-0001", message="hello", request_id="gw-unknown")
+    assert again.get("error") != "request_in_flight", again
+    assert again["ok"] is True and again["delivery_method"] == "gateway_ws"
+
+
+def test_a_gateway_retry_that_loses_its_route_does_not_stay_in_flight(tmp_path, monkeypatch) -> None:
+    home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *_a, **_k: (False, "connection_lost"))
+    first = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert first["error"] == "delivery_unknown", first
+
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("DELETE FROM gateway_routing")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(plugin.delivery, "mount_dormant_local_session", lambda *_a, **_k: (False, "no route"))
+
+    lost = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert lost["error"] == "route_unverified", lost
+    stuck = _send(ctx, target="local-target-0001", message="hello", request_id="gw-wedge")
+    assert stuck.get("error") != "request_in_flight", stuck
+
 
 def test_r5_d04_an_empty_routing_index_is_not_a_verified_route(tmp_path) -> None:
     home, ctx = _pair(tmp_path)
@@ -781,6 +823,30 @@ def test_r6_a_queued_gateway_send_is_not_evicted(tmp_path, monkeypatch) -> None:
     assert len(ctx.injected) == before
 
 
+def test_queued_gateway_sends_fill_the_operation_table(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    ctx._allow_inject = False
+    ctx.allow_gateway_injection = True
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 3)
+    def _queued(*_a, **kwargs):
+        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "queued"
+        return True, "adm"
+
+    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _queued)
+    outcomes = [
+        _send(ctx, target="local-target-0001", message=f"m{n}", request_id=f"q-{n}")
+        for n in range(5)
+    ]
+    assert all(row["ok"] is True and row["status"] == "queued" for row in outcomes[:3]), outcomes[:3]
+    assert outcomes[3]["error"] == "operation_capacity", outcomes[3]
+    assert outcomes[4]["error"] == "operation_capacity", outcomes[4]
+    for record in plugin.delivery._OPERATIONS.values():
+        record["claimed_at"] = time.monotonic() - 121.0
+    later = _send(ctx, target="local-target-0001", message="afterwards", request_id="q-later")
+    assert later["ok"] is True, later
+
+
 def test_r6_a_gateway_retry_replays_before_the_hop_check(tmp_path, monkeypatch) -> None:
     _home, ctx = _pair(tmp_path)
     ctx._allow_inject = False
@@ -806,6 +872,17 @@ def test_r6_a_gateway_retry_replays_before_the_hop_check(tmp_path, monkeypatch) 
     retry = _send(ctx, target="Target", message="hello", request_id="gw-replay")
     assert retry.get("replayed") is True, retry
     assert calls["n"] == 0
+
+
+def test_a_retry_of_a_minted_request_id_does_not_deliver_twice(tmp_path, monkeypatch) -> None:
+    _home, ctx = _pair(tmp_path)
+    plugin = _load_plugin()
+    first = _send(ctx, target="local-target-0001", message="hello")
+    assert first["ok"] is True, first
+    minted = first["request_id"]
+    retry = _send(ctx, target="local-target-0001", message="hello", request_id=minted)
+    assert retry.get("replayed") is True, retry
+    assert len(ctx.injected) == 1
 
 
 def test_r6_a_retry_by_a_title_fragment_or_other_case_does_not_submit_again(tmp_path, monkeypatch) -> None:
