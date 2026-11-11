@@ -82,12 +82,14 @@ SESSION_SEND_SCHEMA: dict = {
             "request_id": {
                 "type": "string",
                 "description": (
-                    "Optional retry identity, 1-1024 characters. Pass the request_id from an earlier "
-                    "result to retry that same operation: an identical inject retry returns the first outcome "
-                    "without delivering again, and a different message under the same id is refused. "
-                    "A gateway submit is deduplicated by the gateway, not replayed here. "
-                    "Omit it for a new send. This identifies one operation inside this process; it is "
-                    "not an exactly-once guarantee across restarts."
+                    "Optional retry identity, 1-1024 characters. While retained, reuse the request_id, "
+                    "body and exact target_session_id from the first result: an inject retry replays "
+                    "the outcome; a gateway retry uses the gateway admission identity. A changed body "
+                    "conflicts. State is process-local, bounded to 4096 entries. Non-active gateway "
+                    "entries older than 120 seconds can be evicted under capacity pressure; completed "
+                    "entries are also evictable. After eviction or restart, check target history before "
+                    "resending because transport identity may be lost. This is not an exactly-once guarantee. "
+                    "Omit this only for genuinely new work."
                 ),
             },
         },

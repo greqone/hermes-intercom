@@ -729,7 +729,7 @@ def test_r6_a_real_root_key_does_not_cross_a_boundary(tmp_path) -> None:
     assert resolved is None and ambiguous == [], (resolved, ambiguous)
 
 
-def test_r6_a_nested_carrier_keeps_the_outer_card(tmp_path) -> None:
+def test_r6_a_literal_nested_summary_quote_has_no_leading_live_envelope(tmp_path) -> None:
     home = _home(tmp_path)
     plugin = _load_plugin()
     card = "[Message from agent 'A'] [intercom from=local-a hop=3/3 mode=fyi]\nbody"
@@ -753,7 +753,9 @@ def test_r6_a_nested_carrier_keeps_the_outer_card(tmp_path) -> None:
     )
     con.commit()
     con.close()
-    assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (3, 3)
+    # This literal nested-summary quotation has no leading live envelope.
+    # Its abbreviated prefix and absent host metadata do not establish a host carrier projection.
+    assert plugin.store.latest_user_message_tag(home, "local-caller-0001") == (0, 0)
 
 
 def test_r6_two_gateway_retries_do_not_both_submit(tmp_path, monkeypatch) -> None:

@@ -671,11 +671,11 @@ def _receipt(home: Any, request_id: str) -> tuple[str, str, str]:
 
 
 def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
-    """A delivered inject can be dropped. A gateway send stays until its receipt is terminal:
-    queued, started and unknown may still land, so forgetting them lets the same request id
-    deliver a second copy through inject_message. A receipt that never arrives would hold its
-    slot forever and eventually refuse every new send, so one older than the dedup window is
-    treated as settled."""
+    """Protect active calls and fresh unresolved gateway attempts from capacity eviction.
+
+    A non-active attempt older than 120 seconds becomes evictable, not settled: it may still
+    land. This finite retention policy can lose transport identity and is not exactly-once.
+    """
     if record.get("_inflight"):
         return True
     if record.get("delivery_method") == "gateway_ws":
@@ -1054,7 +1054,12 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     }
                     for c in candidates
                 ],
-                "hint": "Call session_list first, then pass an exact session_id or unique title substring.",
+                "hint": (
+                    "Call session_list first, then pass an exact session_id or unique title substring. "
+                    "An original ID prefix may stop resolving after compression. For a retained retry, "
+                    "use target_session_id from the first result with the same request_id and body; "
+                    "do not create a new request to recover an uncertain delivery."
+                ),
             }
         )
 
@@ -1465,8 +1470,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "target_session_key": target_key,
             "mounted_dormant": mounted_dormant,
             "message": (
-                "The gateway did not confirm this delivery. Retry with the same request_id. "
-                "A confirmed inject is not sent again; a gateway submit is deduplicated by the gateway."
+                "The gateway did not confirm this delivery. While retained, retry the same request_id, "
+                "body and exact target_session_id from this result. Retry state is process-local, "
+                "bounded to 4096 entries; non-active gateway entries older than 120 seconds can be "
+                "evicted under capacity pressure. After eviction or restart, check target history "
+                "before resending: transport identity may be lost. This is not an exactly-once guarantee."
                 if unknown else
                 "Gateway refused message injection. Ensure "
                 "plugins.entries.hermes-intercom.allow_gateway_injection: true is set in config.yaml "

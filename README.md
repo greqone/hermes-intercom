@@ -11,7 +11,7 @@ Cross-session discovery and inter-agent messaging plugin for Hermes Agent (`>=0.
 - **External-process WS fallback**: When in-process injection is unavailable and `allow_gateway_injection: true` is set, delivers with `prompt.submit` over the local Gateway WebSocket. Mount and submit share one `mount_timeout_seconds` budget. A timed-out submit keeps the reservation. The gateway deduplicates a second submit that reuses the same `request_id`. A refusal from the gateway (`queue_full`, `permission_denied`, `runtime_draining`) is reported as a refusal, not as an unknown outcome. Successful sends are appended to `$HERMES_HOME/cache/hermes-intercom/audit.jsonl`, rotated at 2 MiB.
 - **Desktop Attributed Cards**: Formats outbound messages with `[Message from agent '<sender>'] ` so Hermes Desktop renders them as attributed agent timeline notices rather than human user bubbles. Sender labels are stripped of quotes, brackets, control characters, lone UTF-16 surrogates and bidi/zero-width marks so the card header stays renderable. Lone UTF-16 surrogates in the body are replaced so the card stays UTF-8 encodable. Directive-looking text (`@file`, `@diff`, `@staged`, and a registered `@kind:value`) is neutralized in the header and the body; the readable value stays.
 - **Multi-Hop Loop Guard & Rate Limiting**: Tracks hop depth (`[intercom from=<id> hop=<n>/<max> mode=<reply|fyi>]`) via `pre_llm_call` and transcript fallback — including the parent segment of a fresh post-compression continuation. A card counts when it leads the message, or when it starts its own line after a host queued-prompt marker. A card quoted after ordinary text does not count. Two sessions can exchange a bounded reply without an infinite ping-pong.
-- **Deduplication**: within `dedup_window_seconds` (default 120; `0` disables) a repeat send is refused when the sender session, the `expect_reply` flag and the message body all match. A caller-supplied `request_id` names one operation: the same id with the same body returns the first outcome, and the same id with a different body is refused. Both the dedup window and the rate limit are per process and reset on restart. Per-target rate limiting counts distinct operations inside `burst_window_seconds`.
+- **Deduplication**: within `dedup_window_seconds` (default 120; `0` disables) a repeat send is refused when the sender session, the `expect_reply` flag and the message body all match. While its identity is retained, a caller-supplied `request_id` names one operation: the same id with the same body replays an inject outcome or retries a gateway admission, and the same id with a different body is refused. Both the dedup window and the rate limit are per process and reset on restart. Per-target rate limiting counts distinct operations inside `burst_window_seconds`.
 
 ## Reliability boundaries and host API disclosure
 
@@ -26,9 +26,17 @@ non-terminal gateway entries older than 120 seconds when no call is actively usi
 can be evicted under capacity pressure. After eviction or restart, reuse of an old request
 id is not protected by this plugin's retained transport identity. The gateway applies its
 own admission identity; do not interpret this cache as an exactly-once delivery service.
-Only documented pre-commit RPC refusals release a new reservation; a storage/internal
-error after submit stays `delivery_unknown`. Refusing a refresh does not undo an earlier
-uncertain send.
+Known RPC refusal reasons release a new reservation; a storage/internal error after
+submit stays `delivery_unknown`. A reason name alone is not proof of a pre-commit boundary:
+the installed host can also emit `not_found` during post-commit publication after target
+deletion. No duplicate execution was demonstrated for that case. Refusing a refresh does
+not undo an earlier uncertain send.
+
+An original ID prefix can stop resolving after compression, even while its operation is
+retained (R7-D01, unresolved selector limitation). Recover with the exact
+`target_session_id` from the first result, the same `request_id`, body and `expect_reply`.
+Do not mint a new operation to recover an uncertain send. After eviction or restart,
+inspect target history before resending; the exact-ID recovery also depends on retention.
 
 Catalog Rule 9 remains an explicit review gate: this build uses private
 `hermes_cli.gateway_runtime` / `hermes_cli.gateway_client` helpers and reads
@@ -69,6 +77,22 @@ plugins:
 | `burst_window_seconds` / `max_messages_per_window` | Per-target rate limit shared by all senders; over-limit sends fail with `error=rate_limited`. |
 | `auto_mount_dormant` | Mount a dormant `:local:dm:` target in the gateway authority and retry the refused injection. |
 | `mount_timeout_seconds` | Overall deadline for one gateway operation (mount, or the WS `prompt.submit` fallback), not per step. |
+
+## Python test prerequisites
+
+The full suite requires a complete Hermes Agent checkout and its compatible Python test
+environment, not just this plugin plus pytest. Qualified host source:
+`21ae0e1238fdf466fa52a85a6ebf75d6899e49da` (0.23.0-canary). The tests import real
+`hermes_cli.gateway_runtime` / `gateway_client` during collection. Do not replace them
+with stub modules to manufacture a pass. From the plugin root, using bash:
+
+```bash
+HOST=/absolute/path/to/hermes-agent
+PYTHONPATH="$HOST" HERMES_AGENT_REPO="$HOST" PYTHONDONTWRITEBYTECODE=1 \
+  "$HOST/venv/Scripts/python.exe" -B -m pytest -q
+# On Linux use the compatible native Linux environment, e.g. "$HOST/.venv/bin/python".
+# Windows and Linux results do not qualify macOS or the declared >=0.22.5 floor.
+```
 
 ## Desktop presentation (`desktop/plugin.js`)
 

@@ -549,31 +549,28 @@ def _root_from_key(skey: str) -> str:
 
 
 def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
-    """Compression parent for ``sid``; reset/branch/delegate edges never inherit its hop."""
+    """Compression parent; absence is empty, but read errors must reach the hop guard."""
     if not sid:
         return ""
-    try:
-        colset = {c.lower() for c in _column_names(con, "sessions")}
-        if "id" not in colset or "parent_session_id" not in colset:
-            return ""
-        wanted = "parent_session_id"
-        if "end_reason" in colset:
-            wanted += ", (SELECT p.end_reason FROM sessions p WHERE p.id = sessions.parent_session_id) AS parent_end_reason"
-        if "model_config" in colset:
-            wanted += ", model_config"
-        row = con.execute(
-            f"SELECT {wanted} FROM sessions WHERE id = ? LIMIT 1", (sid,)
-        ).fetchone()
-        parent = str(_row_get(row, "parent_session_id") or "").strip()
-        if "end_reason" in colset and str(_row_get(row, "parent_end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
-            return ""
-        if _is_branch_edge(_row_get(row, "model_config"), parent):
-            return ""
-    except sqlite3.Error:
+    colset = {c.lower() for c in _column_names(con, "sessions")}
+    if "id" not in colset or "parent_session_id" not in colset:
         return ""
+    wanted = "parent_session_id"
+    if "end_reason" in colset:
+        wanted += ", (SELECT p.end_reason FROM sessions p WHERE p.id = sessions.parent_session_id) AS parent_end_reason"
+    if "model_config" in colset:
+        wanted += ", model_config"
+    row = con.execute(
+        f"SELECT {wanted} FROM sessions WHERE id = ? LIMIT 1", (sid,)
+    ).fetchone()
     if row is None:
         return ""
-    return str(_row_get(row, "parent_session_id") or "").strip()
+    parent = str(_row_get(row, "parent_session_id") or "").strip()
+    if "end_reason" in colset and str(_row_get(row, "parent_end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
+        return ""
+    if _is_branch_edge(_row_get(row, "model_config"), parent):
+        return ""
+    return parent
 
 
 def _is_branch_edge(model_config: Any, ancestor_id: str) -> bool:
@@ -711,7 +708,12 @@ def _ancestor_descendants(
                     continue
                 parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
                 parent_reason = str(_row_get(child, "parent_end_reason") or "").strip().lower()
-                if _is_branch_edge(_row_get(child, "model_config"), parent_id) or parent_reason in _BOUNDARY_END_REASONS:
+                if (
+                    _is_branch_edge(_row_get(child, "model_config"), parent_id)
+                    or parent_reason in _BOUNDARY_END_REASONS
+                    # The host also recognizes unmarked legacy children of a branched parent.
+                    or parent_reason == "branched"
+                ):
                     branched.add(cid.lower())
                     continue
                 chain.append(cid.lower())
@@ -1174,7 +1176,8 @@ def _unwrap_carrier(text: str) -> str:
         )
         return live.strip() if sep else text
     if stripped.startswith("[CONTEXT COMPACTION — REFERENCE ONLY]") and marker in stripped:
-        return stripped.rsplit(marker, 1)[1].strip()
+        # Match the host projector: a later literal marker belongs to the live body.
+        return stripped.split(marker, 1)[1].strip()
     return text
 
 
