@@ -209,8 +209,16 @@ def _json(payload: dict[str, Any]) -> str:
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
-        # Degraded but non-raising path for exotic values coming back from the store.
-        return json.dumps(payload, ensure_ascii=False, default=str, allow_nan=True)
+        # JSON's default callback never sees NaN/Infinity: normalize nested numbers too.
+        def clean(value: Any) -> Any:
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {str(key): clean(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [clean(item) for item in value]
+            return value
+        return json.dumps(clean(payload), ensure_ascii=False, default=str, allow_nan=False)
 
 
 def _sanitize_utf8(text: Any) -> str:
@@ -559,12 +567,20 @@ def submit_via_gateway_ws(
 def _classify_ws_exception(exc: BaseException) -> str:
     """Map a gateway exception to a label ``_ws_error_in_flight`` can trust.
 
-    ``GatewayRPCError`` is an owner refusal and ``GatewayClientError(NOT_SENT)`` proves the frame
-    never left. Both roll back. Anything else keeps the reservation, because it may have landed.
+    Only the owner's documented pre-commit reason codes and ``GatewayClientError(NOT_SENT)``
+    prove nothing was queued. Other RPC errors can follow admission and keep the reservation.
     """
     name = type(exc).__name__
     if name == "GatewayRPCError":
-        return f"rpc_refused:{_exc_label(exc)}"
+        # The owner can fail while publishing a receipt AFTER its admission commit. Only
+        # its documented pre-commit refusals prove nothing was queued (owner_forward.py).
+        reason = (getattr(exc, "data", None) or {}).get("reason", str(exc))
+        if reason in {
+            "invalid_params", "runtime_draining", "runtime_retired", "profile_mismatch",
+            "permission_denied", "not_found", "stale_epoch", "admission_conflict", "queue_full",
+        }:
+            return f"rpc_refused:{_exc_label(exc)}"
+        return f"rpc_unconfirmed:{_exc_label(exc)}"
     if name == "GatewayClientError" and "nothing was sent" in str(exc):
         return f"not_sent:{_exc_label(exc)}"
     return _exc_label(exc)
@@ -620,7 +636,7 @@ def _same_operation_target(record: dict[str, Any], target_arg: str, resolved_id:
     only when the whole line back to the stored one is compression, with no reset in it.
     """
     result = record.get("result") or {}
-    session_id = (result.get("target_session_id") or "").lower()
+    session_id = (record.get("target_session_id") or result.get("target_session_id") or "").lower()
     same = resolved_id.lower() == session_id or (
         home is not None and bool(session_id)
         and store.compression_line(home, resolved_id, session_id)
@@ -660,6 +676,8 @@ def _operation_is_live(record: dict[str, Any], token: str = "") -> bool:
     deliver a second copy through inject_message. A receipt that never arrives would hold its
     slot forever and eventually refuse every new send, so one older than the dedup window is
     treated as settled."""
+    if record.get("_inflight"):
+        return True
     if record.get("delivery_method") == "gateway_ws":
         claimed_at = float(record.get("claimed_at") or 0.0)
         if claimed_at and (time.monotonic() - claimed_at) > 120.0:
@@ -892,6 +910,19 @@ def _recent_sends_for(
         if age < keep_win:
             visible.append(row)
     return visible, retained
+
+
+def _rollback_reservation(bucket_key: tuple[str, str], request_id: str) -> None:
+    """Release only this unsent operation's history; caller holds ``_LOCK``."""
+    remaining = [
+        entry for entry in _RECENT_SENDS.get(bucket_key, [])
+        if not (len(entry) > 3 and entry[3] == request_id)
+    ]
+    if remaining:
+        _RECENT_SENDS[bucket_key] = remaining
+    else:
+        _RECENT_SENDS.pop(bucket_key, None)
+        _BUCKET_HORIZON.pop(bucket_key, None)
 
 
 def _classic_cli_host(ctx: Any) -> bool:
@@ -1137,7 +1168,13 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     with _LOCK:
         prior = _OPERATIONS.get(send_token)
-        if prior is not None and prior.get("payload_hash") != payload_hash:
+        same_retry = prior is not None and (
+            prior.get("body") == message_body
+            and bool(prior.get("expect_reply")) == bool(expect_reply)
+            and prior.get("from_session_id") == caller_sid
+            and _same_operation_target(prior, target_arg, resolved["session_id"], home)
+        )
+        if prior is not None and prior.get("payload_hash") != payload_hash and not same_retry:
             return _json({
                 "ok": False,
                 "error": "request_conflict",
@@ -1184,7 +1221,13 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 })
             # Claimed before delivery so a second caller with the same id waits on this one
             # instead of delivering beside it. A gateway retry keeps the record it already has.
-            _OPERATIONS[send_token] = {"payload_hash": payload_hash, "delivered": False, "result": {}, "claimed_at": time.monotonic()}
+            _OPERATIONS[send_token] = {
+                "payload_hash": payload_hash, "delivered": False, "result": {},
+                "claimed_at": time.monotonic(), "home": home_key,
+                "body": message_body, "expect_reply": bool(expect_reply),
+                "from_session_id": caller_sid, "target_session_id": resolved["session_id"],
+                "mount_session_id": resolved["session_id"],
+            }
         _remember_bucket_horizon(bucket_key, keep_win)
         _evict_stale_send_buckets(now_mono)
         history, retained = _recent_sends_for(bucket_key, now_mono, keep_win)
@@ -1194,6 +1237,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         ):
             if prior is None:
                 _OPERATIONS.pop(send_token, None)
+            elif ws_retry:
+                prior.pop("_inflight", None)
+            if bucket_key not in _RECENT_SENDS:
+                _BUCKET_HORIZON.pop(bucket_key, None)
             return _json(
                 {
                     "ok": False,
@@ -1209,6 +1256,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         if send_token[1] not in seen_tokens and len(seen_tokens) >= max_per_win:
             if prior is None:
                 _OPERATIONS.pop(send_token, None)
+            elif ws_retry:
+                prior.pop("_inflight", None)
+            if bucket_key not in _RECENT_SENDS:
+                _BUCKET_HORIZON.pop(bucket_key, None)
             return _json(
                 {
                     "ok": False,
@@ -1261,14 +1312,19 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     def _budget() -> float:
         return max(0.2, min(mount_timeout, overall_deadline - time.monotonic()))
 
-    mount_sid = resolved.get("root_session_id") or resolved["session_id"]
+    with _LOCK:
+        operation = _OPERATIONS.get(send_token) or {}
+        mount_sid = operation.get("mount_session_id") or resolved.get("root_session_id") or resolved["session_id"]
+    if ws_retry:
+        # Report the envelope actually resubmitted, not the current turn's newer hop.
+        next_hop, max_hops = _parse_intercom_tag(payload)
     dormant_local = ":local:dm:" in target_key
     routed = resolved.get("routed", True)
     routed = True if routed is None else bool(routed)
     # R4-D05: a session_key column is metadata. It is unverified only when gateway_routing
     # exists and does not name this session. No routing table at all keeps the old path,
     # because a store without that index cannot prove the key is stale.
-    if routed and dormant_local:
+    if routed:
         db_path = Path(home) / "state.db"
         if db_path.is_file():
             try:
@@ -1278,13 +1334,14 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     sid_to_key, key_to_entry = store._load_routing_map(con, home) if has_index else ({}, {})
                 finally:
                     con.close()
-            except sqlite3.OperationalError:
+            except sqlite3.Error:
                 # The claim was taken and nothing was sent. Leaving it makes every later retry
                 # say request_in_flight forever (R5-D03). Release it and say the store failed.
                 with _LOCK:
                     held = _OPERATIONS.get(send_token)
                     if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
                         _OPERATIONS.pop(send_token, None)
+                        _rollback_reservation(bucket_key, public_request)
                     elif held is not None:
                         held.pop("_inflight", None)
                 return _json({
@@ -1298,8 +1355,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 # when one of the maps had rows. A stored session_key with nothing behind it is
                 # metadata, not a route (R5-D04).
                 route_key = resolved.get("session_key") or ""
-                if route_key not in key_to_entry and resolved["session_id"] not in sid_to_key:
-                    routed = False
+                owner = str((key_to_entry.get(route_key) or {}).get("session_id") or "")
+                routed = bool(owner) and (
+                    owner == resolved["session_id"]
+                    or store.compression_line(home, resolved["session_id"], owner)
+                )
 
     mounted_dormant = False
     delivery_method = "inject_message"
@@ -1322,6 +1382,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             held = _OPERATIONS.get(send_token)
             if held and not held.get("delivered") and held.get("delivery_method") != "gateway_ws":
                 _OPERATIONS.pop(send_token, None)
+                _rollback_reservation(bucket_key, public_request)
             elif held is not None:
                 held.pop("_inflight", None)
         return _json({
@@ -1367,20 +1428,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                 held = _OPERATIONS.get(send_token)
                 if held is not None:
                     held.pop("_inflight", None)
-                remaining = [
-                    entry
-                    for entry in _RECENT_SENDS.get(bucket_key, [])
-                    if not (len(entry) > 3 and entry[3] == public_request)
-                ]
-                if remaining:
-                    _RECENT_SENDS[bucket_key] = remaining
-                else:
-                    _RECENT_SENDS.pop(bucket_key, None)
-                    _BUCKET_HORIZON.pop(bucket_key, None)
-                # A confirmed or unconfirmed gateway attempt keeps its transport. A later retry
-                # must go back to the gateway, not through inject_message (R4-D01).
+                # A refusal of THIS refresh does not settle a previous submit whose receipt
+                # was lost or queued. Keep its history as well as its transport identity.
                 kept = _OPERATIONS.get(send_token)
                 if not (kept and kept.get("delivery_method") == "gateway_ws"):
+                    _rollback_reservation(bucket_key, public_request)
                     _OPERATIONS.pop(send_token, None)
         else:
             # The receipt is gone but the submit may have landed. Remember the transport and
@@ -1392,6 +1444,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
                     held.pop("_inflight", None)
                 prior_op = _OPERATIONS.get(send_token) or {}
                 _OPERATIONS[send_token] = {
+                    **prior_op,
                     "payload_hash": prior_op.get("payload_hash", payload_hash),
                     "delivered": False,
                     "delivery_method": "gateway_ws",
@@ -1470,7 +1523,8 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
         if held is not None:
             held.pop("_inflight", None)
         _OPERATIONS[send_token] = {
-            "payload_hash": payload_hash,
+            **(held or {}),
+            "payload_hash": (held or {}).get("payload_hash", payload_hash),
             "delivered": True,
             "delivery_method": delivery_method,
             "envelope": payload,

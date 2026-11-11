@@ -393,6 +393,24 @@ def query_sessions(
         # F10: subagents and cron rows used to fill the window before any filtering, so a busy
         # profile returned an empty list. Exclude them in SQL; the Python pass stays as a backstop.
         where_parts: list[str] = []
+        if q_norm or src_norm:
+            # Filter before LIMIT: unrelated recent sessions must not hide an old match.
+            # Python's Unicode lower agrees with the public matching pass, unlike SQLite lower.
+            def matches(sid, title, row_source, cwd, stored_key):
+                sid, title, row_source, cwd, stored_key = (
+                    str(value or "") for value in (sid, title, row_source, cwd, stored_key)
+                )
+                skey = sid_to_key.get(sid) or stored_key.strip()
+                if not skey and sid.startswith("local-"):
+                    skey = f"agent:{ns}:local:dm:{sid}"
+                if src_norm and row_source.strip().lower() != src_norm:
+                    return 0
+                return int(not q_norm or q_norm in " ".join(
+                    (sid, _root_from_key(skey), title, row_source, cwd, skey)
+                ).lower())
+            con.create_function("intercom_matches", 5, matches)
+            fields = [col if col in colset else "NULL" for col in ("id", "title", "source", "cwd", "session_key")]
+            where_parts.append(f"intercom_matches({', '.join(fields)}) = 1")
         if "source" in colset:
             excluded = "'subagent'" if include_cron else "'subagent', 'cron'"
             where_parts.append(f"lower(COALESCE(source, '')) NOT IN ({excluded})")
@@ -445,7 +463,7 @@ def query_sessions(
         if not include_cron and msg_count == 0 and not title:
             continue
 
-        explicit_key = str(_row_get(r, "session_key") or "").strip() or sid_to_key.get(sid, "")
+        explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
         # ``routed`` tells delivery whether a real gateway route exists. A merely synthesized
         # ``:local:dm:`` key can pass core's admissibility check and be dropped asynchronously, so a
         # dormant mount must happen before injecting.
@@ -531,16 +549,26 @@ def _root_from_key(skey: str) -> str:
 
 
 def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
-    """``parent_session_id`` for ``sid`` ("" when unknown), never raising."""
+    """Compression parent for ``sid``; reset/branch/delegate edges never inherit its hop."""
     if not sid:
         return ""
     try:
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if "id" not in colset or "parent_session_id" not in colset:
             return ""
+        wanted = "parent_session_id"
+        if "end_reason" in colset:
+            wanted += ", (SELECT p.end_reason FROM sessions p WHERE p.id = sessions.parent_session_id) AS parent_end_reason"
+        if "model_config" in colset:
+            wanted += ", model_config"
         row = con.execute(
-            "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1", (sid,)
+            f"SELECT {wanted} FROM sessions WHERE id = ? LIMIT 1", (sid,)
         ).fetchone()
+        parent = str(_row_get(row, "parent_session_id") or "").strip()
+        if "end_reason" in colset and str(_row_get(row, "parent_end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
+            return ""
+        if _is_branch_edge(_row_get(row, "model_config"), parent):
+            return ""
     except sqlite3.Error:
         return ""
     if row is None:
@@ -741,7 +769,7 @@ def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key)
         return None
     if str(_row_get(r, "end_reason") or "").strip().lower() in _COMPRESSED_END_REASONS:
         return None
-    explicit_key = str(_row_get(r, "session_key") or "").strip() or sid_to_key.get(sid, "")
+    explicit_key = sid_to_key.get(sid, "") or str(_row_get(r, "session_key") or "").strip()
     routed = bool(explicit_key)
     skey = explicit_key or (f"agent:{ns}:local:dm:{sid}" if sid.startswith("local-") else "")
     root_sid = skey.rsplit(":", 1)[-1] if skey and ":local:dm:local-" in skey else sid
@@ -807,13 +835,25 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
         if activity:
             order_terms.append(f"COALESCE({', '.join(activity)}, 0) DESC")
         order_sql = (" ORDER BY " + ", ".join(order_terms)) if order_terms else ""
+        sid_to_key, entries = _load_routing_map(con, home)
+        route_owner = next((str(entry.get("session_id") or "") for key, entry in entries.items()
+                            if key.lower() == text.lower()), "")
+        # Exact physical ids take precedence over route metadata. The route index can name an
+        # old owner outside the discovery window and sessions.session_key may be NULL.
         row = con.execute(
-            f"SELECT {select_list} FROM sessions WHERE {' OR '.join(clauses)}{order_sql} LIMIT 1",
-            tuple(params),
+            f"SELECT {select_list} FROM sessions WHERE lower(id) = ? LIMIT 1", (text.lower(),)
         ).fetchone()
+        if row is None and route_owner:
+            row = con.execute(
+                f"SELECT {select_list} FROM sessions WHERE id = ? LIMIT 1", (route_owner,)
+            ).fetchone()
+        if row is None:
+            row = con.execute(
+                f"SELECT {select_list} FROM sessions WHERE {' OR '.join(clauses)}{order_sql} LIMIT 1",
+                tuple(params),
+            ).fetchone()
         if row is None:
             return None
-        sid_to_key, _entries = _load_routing_map(con, home)
         built = _row_to_session(
             row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
             caller_session_key=caller_session_key,
@@ -893,7 +933,7 @@ def _scan_title_and_prefix(
         where_sql = (" WHERE " + " OR ".join(clauses)) if clauses else ""
         rows = con.execute(
             f"SELECT {select_list} FROM sessions{where_sql}", tuple(params)
-        ).fetchall()
+        )
         for row in rows:
             built = _row_to_session(
                 row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
@@ -1125,14 +1165,16 @@ def _unwrap_carrier(text: str) -> str:
     reading the wrapped string finds no leading card, so an exhausted chain sends again at hop 1.
     """
     marker = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
-    if marker in text:
-        tail = text.rsplit(marker, 1)[1].strip()
-        if tail:
-            return tail
-    if "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]" in text:
-        head, _tail = text.rsplit("[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]", 1)
-        header = "[PRIOR CONTEXT — for reference only; not a new message]"
-        return head.replace(header, "", 1).strip()
+    stripped = text.lstrip()
+    # Delimiters inside an ordinary card or human quotation are body text, not host structure.
+    header = "[PRIOR CONTEXT — for reference only; not a new message]"
+    if stripped.startswith(header):
+        live, sep, _summary = stripped[len(header):].partition(
+            "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+        )
+        return live.strip() if sep else text
+    if stripped.startswith("[CONTEXT COMPACTION — REFERENCE ONLY]") and marker in stripped:
+        return stripped.rsplit(marker, 1)[1].strip()
     return text
 
 

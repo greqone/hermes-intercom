@@ -410,6 +410,10 @@ def test_cli_surface_without_a_classic_repl_still_uses_the_gateway_injector(
         (telegram, "telegram", "m", None, 1, None, None, 4, "", "Ops channel", 0, 0,
          "agent:main:telegram:dm:ops", 1800.0),
     )
+    con.execute(
+        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
+        ("agent:main:telegram:dm:ops", json.dumps({"session_id": telegram})),
+    )
     con.commit()
     con.close()
     monkeypatch.setenv("HERMES_HOME", str(home))
