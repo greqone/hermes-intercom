@@ -2,6 +2,14 @@
 
 Cross-session discovery and inter-agent messaging plugin for Hermes Agent (`>=0.22.5`).
 
+Integration notes: [independent audit reconciliation](INTEGRATION.md). Compression
+alias and persisted-hop traversal are bounded to 256 identities; unresolved hop
+cycles or bound exhaustion refuse delivery. A current scoped hook observation
+takes precedence over an older persisted row; empty input and pure synthetic
+summaries do not reset the budget. Caller-supplied request IDs are validated
+without whitespace trimming or surrogate replacement. Configuration parsing
+supports the host's ruamel.yaml as well as older PyYAML environments.
+
 ## Features
 
 - **`session_list`**: Read-only discovery of active and recent sessions in the current profile (`state.db` + `gateway_routing`), filtering out subagents, cron jobs, compression-ancestor segments, and archived chats by default. The store is read schema-tolerantly: a `state.db` missing optional `sessions` columns gets `NULL` substitutions, `gateway_routing` column presence is probed before querying, and result materialization is bounded; query/source filters run before the result window, though matching can still scan the table. Every entry reports `session_id`, `root_session_id`, `title`, `source`, `model`, `cwd`, `session_key`, `message_count`, `last_activity_at`, `addressable`, `routed`, and `is_self`.

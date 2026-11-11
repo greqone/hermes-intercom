@@ -548,6 +548,9 @@ def _root_from_key(skey: str) -> str:
     return text.rsplit(":", 1)[-1]
 
 
+_LINEAGE_MAX = 256
+
+
 def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
     """Compression parent; absence is empty, but read errors must reach the hop guard."""
     if not sid:
@@ -556,6 +559,8 @@ def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
     if "id" not in colset or "parent_session_id" not in colset:
         return ""
     wanted = "parent_session_id"
+    if "source" in colset:
+        wanted += ", source"
     if "end_reason" in colset:
         wanted += ", (SELECT p.end_reason FROM sessions p WHERE p.id = sessions.parent_session_id) AS parent_end_reason"
     if "model_config" in colset:
@@ -564,6 +569,8 @@ def _parent_session_id(con: sqlite3.Connection, sid: str) -> str:
         f"SELECT {wanted} FROM sessions WHERE id = ? LIMIT 1", (sid,)
     ).fetchone()
     if row is None:
+        return ""
+    if str(_row_get(row, "source") or "").strip().lower() in {"tool", "subagent"}:
         return ""
     parent = str(_row_get(row, "parent_session_id") or "").strip()
     if "end_reason" in colset and str(_row_get(row, "parent_end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
@@ -650,102 +657,66 @@ def _same_title(left: str, right: str) -> bool:
 
 
 def _ancestor_descendants(
-    home: Path, needle_low: str, all_sessions: list[dict[str, Any]]
+    home: Path, needle_low: str, all_sessions: list[dict[str, Any]], *,
+    ns: str = "main", caller_session_id: str = "", caller_session_key: str = "",
 ) -> list[dict[str, Any]]:
-    """Live descendants of ``needle_low``, with branch/reset/delegate edges removed.
+    """Read the actual compression lineage, without route dedup or a recency window.
 
-    Empty when the id is not an ancestor. More than one entry means the lineage is ambiguous and
-    the caller must say so instead of guessing.
+    Only a parent ended by compression licenses a continuation edge. Reset/branch/
+    delegate markers and tool children end that path. Two live siblings stay two
+    candidates even when their routing keys are identical.
     """
-    if not needle_low or not all_sessions:
-        return []
     db_path = Path(home) / "state.db"
-    if not db_path.is_file():
+    if not needle_low or not db_path.is_file():
         return []
-
-    chain: list[str] = []
-    ancestor_key = ""
-    branched: set[str] = set()
     con: sqlite3.Connection | None = None
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
-        if "id" not in colset:
+        if not {"id", "parent_session_id", "end_reason"} <= colset:
             return []
-        has_key = "session_key" in colset
-        has_parent = "parent_session_id" in colset
-        has_config = "model_config" in colset
-        wanted = ["id"] + (["session_key"] if has_key else []) + (
-            ["parent_session_id"] if has_parent else []
-        ) + (["model_config"] if has_config else [])
-        if has_parent and "end_reason" in colset:
-            wanted.append(
-                "(SELECT s2.end_reason FROM sessions s2 WHERE s2.id = s.parent_session_id) AS parent_end_reason"
-            )
-        row = con.execute(
-            f"SELECT {', '.join(wanted)} FROM sessions s WHERE lower(s.id) = ? LIMIT 1", (needle_low,),
+        wanted = _SESSION_OPTIONAL_COLUMNS + ("model_config",)
+        select_list = "id, " + _projection(colset, wanted)
+        ancestor = con.execute(
+            f"SELECT {select_list} FROM sessions WHERE lower(id) = ? LIMIT 1", (needle_low,)
         ).fetchone()
-        if row is None:
+        if str(_row_get(ancestor, "end_reason") or "").strip().lower() not in _COMPRESSED_END_REASONS:
             return []
-        ancestor_id = str(_row_get(row, "id") or "")
-        if not ancestor_id:
-            return []
-        ancestor_key = str(_row_get(row, "session_key") or "").strip()
-        chain = [ancestor_id.lower()]
-        frontier = [ancestor_id]
-        for _ in range(5):
-            if not has_parent or not frontier:
-                break
-            marks = ",".join("?" for _ in frontier)
-            child_rows = con.execute(
-                f"SELECT {', '.join(wanted)} FROM sessions s WHERE lower(s.parent_session_id) IN ({marks})",
-                [item.lower() for item in frontier],
-            ).fetchall()
+        sid_to_key, _entries = _load_routing_map(con, home)
+        frontier = [str(_row_get(ancestor, "id"))]
+        seen = {frontier[0].lower()}
+        candidates: list[dict[str, Any]] = []
+        while frontier:
             next_frontier: list[str] = []
-            for child in child_rows:
-                cid = str(_row_get(child, "id") or "")
-                if not cid or cid.lower() in chain:
-                    continue
-                parent_id = str(_row_get(child, "parent_session_id") or ancestor_id)
-                parent_reason = str(_row_get(child, "parent_end_reason") or "").strip().lower()
-                if (
-                    _is_branch_edge(_row_get(child, "model_config"), parent_id)
-                    or parent_reason in _BOUNDARY_END_REASONS
-                    # The host also recognizes unmarked legacy children of a branched parent.
-                    or parent_reason == "branched"
+            for parent in frontier:
+                for child in con.execute(
+                    f"SELECT {select_list} FROM sessions WHERE lower(parent_session_id) = ?", (parent.lower(),)
                 ):
-                    branched.add(cid.lower())
-                    continue
-                chain.append(cid.lower())
-                next_frontier.append(cid)
+                    sid = str(_row_get(child, "id") or "")
+                    if not sid or sid.lower() in seen:
+                        continue
+                    seen.add(sid.lower())
+                    if len(seen) > _LINEAGE_MAX:
+                        raise StoreReadError("Compression lineage exceeds safe resolution bound")
+                    source = str(_row_get(child, "source") or "").strip().lower()
+                    if source in {"tool", "subagent"} or _is_branch_edge(_row_get(child, "model_config"), parent):
+                        continue
+                    reason = str(_row_get(child, "end_reason") or "").strip().lower()
+                    if reason in _COMPRESSED_END_REASONS:
+                        next_frontier.append(sid)
+                        continue
+                    if reason in _BOUNDARY_END_REASONS or reason == "branched":
+                        continue
+                    item = _row_to_session(child, sid_to_key, ns=ns, caller_session_id=caller_session_id, caller_session_key=caller_session_key)
+                    if item is not None and (item["_active"] or reason in _AUTOMATIC_END_REASONS) and not item["_archived"] and not item["_cron"]:
+                        candidates.append(item)
             frontier = next_frontier
-    except sqlite3.Error:
-        return []
+        return candidates
+    except sqlite3.Error as exc:
+        raise StoreReadError(str(exc)) from exc
     finally:
         if con is not None:
             con.close()
-
-    by_sid = {s["session_id"].lower(): s for s in all_sessions}
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for cid in chain:
-        found = by_sid.get(cid)
-        if found is not None and cid not in seen:
-            candidates.append(found)
-            seen.add(cid)
-
-    candidates = [c for c in candidates if c["session_id"].lower() != needle_low]
-    candidates = [c for c in candidates if c["session_id"].lower() not in branched]
-    live = [
-        c for c in candidates
-        if not c.get("_archived") and not c.get("_cron")
-        and (c.get("_active", True) or c.get("_end_reason") in _AUTOMATIC_END_REASONS)
-    ]
-    # An archived or cron descendant is not a conversation to deliver into, and neither is one the
-    # user deliberately ended. A descendant closed by automatic cleanup is resumable: the host clears
-    # that stamp on the next compression (hermes_state_common.py, _AUTOMATIC_END_REASONS). Dropping
-    # those made a compressed ancestor resolve to nothing (R5B-03).
-    return live
 
 
 def _resolve_ancestor_alias(
@@ -995,6 +966,16 @@ def resolve_target(
             return None, []
         return direct, []
 
+    # Resolve physical compression edges before any route-key deduplication.
+    descendants = _ancestor_descendants(
+        home, needle_low, [], ns=ns, caller_session_id=caller_session_id,
+        caller_session_key=caller_session_key,
+    )
+    if len(descendants) == 1:
+        return descendants[0], []
+    if len(descendants) > 1:
+        return None, descendants[:8]
+
     # Rank over a much wider window than the public session_list cap so the compression
     # alias can still see the live continuation. Prefix and title resolution do not use
     # this window: a second match past it would otherwise look unique.
@@ -1027,15 +1008,6 @@ def resolve_target(
         if len(active_exact) == 1:
             return active_exact[0], []
         return None, (active_exact or exact_id)[:8]
-
-    # Tier 1b - an ended/compressed segment id resolves to its live continuation. Several live
-    # descendants and no lineage to separate them is ambiguity, not a miss (S01).
-    alias = _resolve_ancestor_alias(home, needle_low, all_sessions)
-    if alias is not None:
-        return alias, []
-    descendants = _ancestor_descendants(home, needle_low, all_sessions)
-    if len(descendants) > 1:
-        return None, descendants[:8]
 
     prefix_hits, title_hits = _scan_title_and_prefix(
         home, needle, needle_low, ns=ns, caller_session_id=caller_session_id,
@@ -1232,7 +1204,8 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
     ``(-1, 0)`` means the store could not be read, which is not an untagged turn.
 
     Right after context compression the caller's ``session_id`` is a fresh continuation segment
-    with no messages yet, so up to five ``parent_session_id`` hops are checked.
+    with no messages yet. Verified compression parents are checked up to a bounded limit;
+    exhaustion or a cycle fails closed.
     """
     sid = str(session_id or "").strip()
     if not sid:
@@ -1250,9 +1223,11 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
         order_col = "id" if "id" in msg_cols else ("timestamp" if "timestamp" in msg_cols else "rowid")
         current = sid
         seen: set[str] = set()
-        for _ in range(6):  # this segment, then up to five parent segments
-            if not current or current in seen:
-                break
+        for _ in range(_LINEAGE_MAX):
+            if not current:
+                return 0, 0
+            if current in seen:
+                return -1, 0
             seen.add(current)
             where = "session_id = ?" + (" AND role = 'user'" if has_role else "")
             # A pure compression summary is not a turn, so it must not hide the parent's card
@@ -1278,6 +1253,8 @@ def latest_user_message_tag(home: Path, session_id: str) -> tuple[int, int]:
                 # A real user turn (tagged or not) is authoritative for this segment.
                 return parse_intercom_tag(str(_row_get(row, "content") or ""))
             current = _parent_session_id(con, current)
+        # A truncated/cyclic history is unknown, never permission to restart at hop one.
+        return (-1, 0) if current else (0, 0)
     except sqlite3.Error:
         return -1, 0
     finally:

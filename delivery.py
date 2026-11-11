@@ -248,8 +248,16 @@ def _is_gateway_injection_allowed(ctx: Any, home: Path) -> bool:
     if not cfg_path.is_file():
         return False
     try:
-        import yaml
-        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
+        document = cfg_path.read_text(encoding="utf-8-sig")
+        try:
+            from ruamel.yaml import YAML
+        except ImportError:
+            import yaml
+            cfg = yaml.safe_load(document) or {}
+        else:
+            parser = YAML(typ="safe", pure=True)
+            parser.version = (1, 1)
+            cfg = parser.load(document) or {}
         entries = ((cfg.get("plugins") or {}).get("entries") or {}) if isinstance(cfg, dict) else {}
         entry = entries.get(plugin_id) if isinstance(entries, dict) else None
         return isinstance(entry, dict) and entry.get("allow_gateway_injection") is True
@@ -794,18 +802,22 @@ def on_pre_llm_call(session_id: str = "", user_message: Any = None, *, ctx: Any 
     if not sid:
         return None
     text = _message_text(user_message)
+    # Missing input and pure synthetic summaries cannot establish a fresh human turn.
+    if not text.strip() or (
+        text.lstrip().startswith("[CONTEXT COMPACTION — REFERENCE ONLY]")
+        and store._unwrap_carrier(text) == text
+    ):
+        return None
     hop, sender_max_hops = _parse_intercom_tag(text)
     home_key = str(store.resolve_home(ctx)) if ctx is not None else ""
     key = (home_key, sid)
     now_mono = time.monotonic()
     with _LOCK:
         _evict_stale_turn_hops(now_mono)
-        if hop > 0:
-            _remember_turn_hop(key, hop, sender_max_hops, now_mono)
-            if home_key:
-                _TURN_HOP.pop(("", sid), None)
-        else:
-            _TURN_HOP.pop(key, None)
+        # Zero is an observed current turn, not a cache miss. The DB can lag its flush.
+        _remember_turn_hop(key, hop, sender_max_hops, now_mono)
+        if home_key:
+            _TURN_HOP.pop(("", sid), None)
     return None
 
 
@@ -1017,8 +1029,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # A retry names work that already happened. Look it up before the hop guard and before the
     # target is resolved again: compression rotates the physical session id, and a later turn can
     # raise the hop, but neither changes the operation that was already accepted (R5-D02).
-    supplied_request = _sanitize_utf8(raw_request or "").strip()
-    if supplied_request and (len(supplied_request) > 1024 or any(ch.isspace() for ch in supplied_request)):
+    supplied_request = raw_request or ""
+    if supplied_request and (len(supplied_request) > 1024 or any(
+        ch.isspace() or ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+        for ch in supplied_request
+    )):
         return _json({
             "ok": False,
             "error": "invalid_request_id",
@@ -1114,7 +1129,10 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     mem_hop, sender_max_hops = _hop_parts(entry)
     # The in-memory pair dies with the process. The stored card still carries both numbers,
     # so a restart must not silently raise a budget the sender already lowered.
-    db_hop, db_max_hops = store.latest_user_message_tag(home, caller_sid) if caller_sid else (0, 0)
+    db_hop, db_max_hops = (
+        store.latest_user_message_tag(home, caller_sid)
+        if caller_sid and entry is None else (0, 0)
+    )
     if db_hop < 0:
         return _json({
             "ok": False,
@@ -1151,8 +1169,11 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # A caller-supplied id is the gateway admission key (principal + session + request_id), so a
     # retry of an ambiguous result reuses it instead of minting a second message. A new send still
     # gets its own id. The host refuses anything empty or longer than 1024 characters.
-    supplied_request = _sanitize_utf8(raw_request or "").strip()
-    if supplied_request and (len(supplied_request) > 1024 or any(ch.isspace() for ch in supplied_request)):
+    supplied_request = raw_request or ""
+    if supplied_request and (len(supplied_request) > 1024 or any(
+        ch.isspace() or ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+        for ch in supplied_request
+    )):
         return _json({
             "ok": False,
             "error": "invalid_request_id",
@@ -1315,7 +1336,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     mount_timeout = float(cfg["mount_timeout_seconds"])
 
     def _budget() -> float:
-        return max(0.2, min(mount_timeout, overall_deadline - time.monotonic()))
+        return max(0.0, min(mount_timeout, overall_deadline - time.monotonic()))
 
     with _LOCK:
         operation = _OPERATIONS.get(send_token) or {}
@@ -1371,7 +1392,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     # Mount writes the target back into the gateway. That is the same grant as injection (F05).
     gateway_granted = _is_gateway_injection_allowed(ctx, home)
 
-    if not routed and dormant_local and cfg["auto_mount_dormant"] and gateway_granted:
+    if not routed and dormant_local and cfg["auto_mount_dormant"] and gateway_granted and _budget() > 0:
         # Unrouted :local:dm: keys are a false positive for core: inject_message returns True
         # synchronously and then drops the payload, so mount before injecting (W202).
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
@@ -1404,7 +1425,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     if (
         not accepted and injectable and not mounted_dormant and cfg["auto_mount_dormant"]
-        and dormant_local and gateway_granted
+        and dormant_local and gateway_granted and _budget() > 0
     ):
         # Routed but not mounted in authority.sessions right now: core returns False synchronously.
         mounted_ok, _info = mount_dormant_local_session(home, mount_sid, timeout=_budget())
@@ -1414,7 +1435,9 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
 
     ws_err = ""
     admission_id = ""
-    if not accepted and gateway_granted and dormant_local:
+    if not accepted and gateway_granted and dormant_local and _budget() <= 0:
+        ws_err = "pre_submit:deadline_exhausted"
+    elif not accepted and gateway_granted and dormant_local:
         ws_ok, ws_err = submit_via_gateway_ws(
             home, mount_sid, payload, timeout=_budget(), request_id=public_request
         )
