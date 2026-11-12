@@ -77,34 +77,9 @@ class StoreReadError(RuntimeError):
 
 
 def resolve_home(ctx: Any = None) -> Path:
-    """Resolve the Hermes home directory for this call.
-
-    Order: explicit ``ctx.home_path`` -> the host manager's home (``ctx._manager.home_path``,
-    which is where ``PluginContext`` actually keeps the profile) -> ``hermes_constants.get_hermes_home()``
-    (which already honors the thread/async ContextVar override *and* ``HERMES_HOME``) -> a stripped and
-    expanded ``HERMES_HOME`` -> ``~/.hermes``.
-    """
-    if ctx is not None:
-        home = getattr(ctx, "home_path", None)
-        if home is None:
-            manager = getattr(ctx, "_manager", None)
-            home = getattr(manager, "home_path", None)
-        if home is not None:
-            text = str(home).strip()
-            if text:
-                return Path(os.path.expanduser(os.path.expandvars(text))).resolve()
-    try:
-        from hermes_constants import get_hermes_home
-
-        core_home = get_hermes_home()
-        if core_home is not None and str(core_home).strip():
-            return Path(os.path.expanduser(os.path.expandvars(str(core_home).strip()))).resolve()
-    except Exception:
-        pass
-    env_home = (os.environ.get("HERMES_HOME") or "").strip()
-    if env_home:
-        return Path(os.path.expanduser(os.path.expandvars(env_home))).resolve()
-    return (Path.home() / ".hermes").resolve()
+    """Read the profile bound by the host to this tool/hook through its public API."""
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home()).resolve()
 
 
 def profile_namespace(ctx: Any = None) -> str:
@@ -621,7 +596,7 @@ def compression_line(home: Path, resolved_id: str, stored_id: str) -> bool:
         has_config = "model_config" in colset
         current = start
         seen: set[str] = set()
-        for _ in range(6):
+        for _ in range(_LINEAGE_MAX):
             if not current or current in seen:
                 return False
             seen.add(current)

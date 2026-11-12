@@ -146,6 +146,8 @@ def test_real_plugin_manager_and_registry_dispatch_positive_and_negative(
     if str(HERMES_REPO) not in sys.path:
         sys.path.insert(0, str(HERMES_REPO))
 
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "desktop")
+
     from hermes_cli.plugins import PluginManager
     from tools.registry import registry
 

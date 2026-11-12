@@ -190,20 +190,3 @@ def test_retry_prefix_limitation_returns_safe_exact_id_recovery(tmp_path):
     recovered = _send(ctx, target=first["target_session_id"], message="same work", request_id="prefix-retry")
     assert recovered["ok"] is True and recovered["replayed"] is True, recovered
     assert len(ctx.injected) == 1
-
-
-def test_retry_schema_and_unknown_result_disclose_retention(tmp_path, monkeypatch):
-    _home, ctx = _pair(tmp_path)
-    plugin = _plugin()
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    ctx._settings["auto_mount_dormant"] = False
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
-    result = _send(ctx, target="local-target-0001", message="uncertain", request_id="unknown-contract")
-    assert result["error"] == "delivery_unknown"
-    schema = SESSION_SEND_SCHEMA["parameters"]["properties"]["request_id"]["description"]
-    for text in (schema, result["message"]):
-        assert "4096" in text and "120" in text
-        assert "eviction" in text and "restart" in text
-        assert "history" in text and "exactly-once" in text
-    assert plugin.delivery._OPERATION_MAX == 4096

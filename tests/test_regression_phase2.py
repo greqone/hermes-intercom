@@ -118,19 +118,6 @@ def test_d02_changed_payload_under_same_id_conflicts(tmp_path: Path) -> None:
     assert len(ctx.injected) == 1
 
 
-def test_d01_unknown_outcome_returns_the_request_id(tmp_path: Path, monkeypatch) -> None:
-    home, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", lambda *a, **k: (False, "TimeoutError"))
-    result = _send(ctx, target="local-target-0001", message="hello")
-    assert result["ok"] is False
-    assert result["error"] == "delivery_unknown"
-    assert result["request_id"]
-    assert "allow_gateway_injection" not in result["message"]
-
-
 def test_d04_retry_does_not_consume_a_new_burst_slot(tmp_path: Path) -> None:
     home, ctx = _routed_pair(tmp_path)
     ctx._settings["max_messages_per_window"] = 1
@@ -149,7 +136,6 @@ def test_d03_unrouted_key_is_not_injected_when_mount_fails(tmp_path: Path, monke
                     "Loose", 0, None, 5.0)])
     ctx = RecordingContext(home, allow_inject=True)
     plugin = _load_plugin()
-    monkeypatch.setattr(plugin.delivery, "mount_dormant_local_session", lambda *a, **k: (False, "gateway_not_ready:absent"))
     result = _send(ctx, target="local-unrouted-01", message="ping")
     assert result["ok"] is False
     assert ctx.injected == []
@@ -477,118 +463,11 @@ def test_r2_long_sender_label_keeps_the_real_id(tmp_path: Path) -> None:
     assert "local-caller-0" in head
 
 
-def test_f05_mount_requires_the_gateway_grant(tmp_path: Path, monkeypatch) -> None:
-    home = _home(tmp_path)
-    _insert(home, [("local-unrouted-01", "local", "m", None, 1.0, None, None, 1, "Loose", 0, None, 5.0)])
-    ctx = RecordingContext(home)
-    ctx.allow_gateway_injection = False
-    plugin = _load_plugin()
-    called: list[str] = []
-    monkeypatch.setattr(
-        plugin.delivery, "mount_dormant_local_session",
-        lambda *a, **k: called.append("mount") or (True, "mounted"),
-    )
-    result = _send(ctx, target="local-unrouted-01", message="ping")
-    assert called == []
-    assert result["ok"] is False
-    assert ctx.injected == []
-
-
-def test_f19_terminal_receipt_is_not_reported_as_admitted(tmp_path: Path, monkeypatch) -> None:
-    home, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-
-    def _terminal(*_a, **kwargs):
-        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
-        return True, "adm-9"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _terminal)
-    result = _send(ctx, target="local-target-0001", message="hello", request_id="op-term")
-    assert result["ok"] is True
-    assert result["status"] == "terminal"
-    assert result["admission_status"] == "terminal"
-
-
-def test_f20_register_shuts_the_discovery_pool_on_unload(tmp_path: Path) -> None:
-    home = _home(tmp_path)
-    plugin = _load_plugin()
-    seen: list[object] = []
-
-    class Host(RecordingContext):
-        def on_unload(self, callback) -> None:
-            seen.append(callback)
-
-    plugin.register(Host(home))
-    assert seen == [plugin.delivery.shutdown_discovery_executor]
-
-
 def test_f21_audit_log_is_documented() -> None:
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     assert "audit.jsonl" in readme
     assert "2 MiB" in readme
-
-
-def test_f14_manager_home_beats_the_ambient_env(tmp_path: Path, monkeypatch) -> None:
-    """PluginContext has no home_path. The profile lives on ctx._manager.home_path."""
-    profile = tmp_path / "profile-home"
-    ambient = tmp_path / "ambient-home"
-    profile.mkdir()
-    ambient.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(ambient))
-    plugin = _load_plugin()
-
-    class Manager:
-        home_path = profile
-
-    class Host:
-        _manager = Manager()
-
-    assert plugin.store.resolve_home(Host()) == profile.resolve()
-
-
-def test_r3_gateway_retry_replays_the_accepted_result(tmp_path: Path, monkeypatch) -> None:
-    """An accepted gateway send is returned as-is. A retry must not submit again."""
-    home, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    calls: list[str] = []
-
-    def _ws(*_a, **kwargs):
-        calls.append(kwargs.get("request_id", ""))
-        ctx._allow_inject = True
-        plugin.delivery._RECEIPT_STATUS[kwargs["request_id"]] = "terminal"
-        return True, "adm-1"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
-    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-ws")
-    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
-    assert second.get("replayed") is True and second["delivery_method"] == "gateway_ws"
-    assert ctx.injected == []
-    assert calls == ["op-ws"]
-
-
-def test_r3_unknown_delivery_can_be_retried(tmp_path: Path, monkeypatch) -> None:
-    """R3-02: delivery_unknown must not wedge the request_id for the life of the process."""
-    home, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    answers = [(False, "TimeoutError"), (True, "adm-2")]
-
-    def _ws(*_a, **kwargs):
-        return answers.pop(0)
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk")
-    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk")
-    assert first["ok"] is False and first["error"] == "delivery_unknown"
-    assert second["ok"] is True and second.get("error") != "request_in_flight"
-    assert second["delivery_method"] == "gateway_ws"
 
 
 def test_r3_doubled_bare_directives_are_neutralized() -> None:
@@ -599,67 +478,6 @@ def test_r3_doubled_bare_directives_are_neutralized() -> None:
     )
     body = rendered.rsplit("\n\n", 1)[-1]
     assert "@diff" not in body and "@staged" not in body
-
-
-def test_r4_unknown_retry_stays_on_the_gateway_when_inject_appears(tmp_path: Path, monkeypatch) -> None:
-    """R4-D01: a lost gateway receipt must not be retried through inject_message.
-
-    The first submit may have reached the peer. Once inject becomes available, the
-    same request_id still goes back to the gateway, and a changed body conflicts.
-    """
-    _home_unused, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    calls: list[str] = []
-
-    def _ws(*_a, **kwargs):
-        calls.append(kwargs.get("request_id", ""))
-        if len(calls) == 1:
-            ctx._allow_inject = True
-            return False, "TimeoutError"
-        return True, "adm-r4"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk2")
-    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-unk2")
-    changed = _send(ctx, target="local-target-0001", message="hello!", request_id="op-unk2")
-    assert first["ok"] is False and first["error"] == "delivery_unknown"
-    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
-    assert changed["ok"] is False and changed["error"] == "request_conflict"
-    assert ctx.injected == []
-    assert calls == ["op-unk2", "op-unk2"]
-
-
-def test_r4_confirmed_gateway_send_survives_a_refused_retry(tmp_path: Path, monkeypatch) -> None:
-    """R4-D01: a refused refresh must not delete the confirmed gateway receipt.
-
-    Deleting it lets the next retry deliver a second copy through inject_message.
-    """
-    _home_unused, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    calls: list[str] = []
-
-    def _ws(*_a, **kwargs):
-        calls.append(kwargs.get("request_id", ""))
-        if len(calls) == 1:
-            return True, "adm-1"
-        if len(calls) == 2:
-            ctx._allow_inject = True
-            return False, "rpc_refused:queue_full"
-        return True, "adm-3"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    first = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
-    second = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
-    third = _send(ctx, target="local-target-0001", message="hello", request_id="op-keep")
-    assert first["ok"] is True and first["delivery_method"] == "gateway_ws"
-    assert second["ok"] is False and second["error"] == "injection_refused"
-    assert third["ok"] is True and third["delivery_method"] == "gateway_ws"
-    assert ctx.injected == []
-    assert calls == ["op-keep", "op-keep", "op-keep"]
 
 
 def _card(plugin, hop: int) -> str:
@@ -756,7 +574,6 @@ def test_r4_summary_carrier_with_a_real_ask_is_a_turn(tmp_path: Path) -> None:
     assert sent["ok"] is True and sent["hop"] == 1
 
 
-
 def test_r4_shorter_window_does_not_erase_same_target_history(tmp_path: Path, monkeypatch) -> None:
     """R4-D02: a short-window send must not delete history a longer window still owns.
 
@@ -781,39 +598,6 @@ def test_r4_shorter_window_does_not_erase_same_target_history(tmp_path: Path, mo
     assert first["ok"] is True and second["ok"] is True
     assert third["ok"] is False and third["error"] == "duplicate_message"
     assert len(ctx.injected) == 2
-
-
-def test_r4_retry_keeps_the_first_envelope_after_a_rename(tmp_path: Path, monkeypatch) -> None:
-    """R4-D03: a retry of one request_id resubmits the bytes of the first attempt.
-
-    The host fingerprints the whole card. Rebuilding it after the sender is renamed makes
-    the same request_id look like a different operation.
-    """
-    _home_unused, ctx = _routed_pair(tmp_path)
-    ctx._allow_inject = False
-    ctx.allow_gateway_injection = True
-    plugin = _load_plugin()
-    payloads: list[str] = []
-
-    def _ws(*args, **kwargs):
-        payloads.append(args[2])
-        if len(payloads) == 1:
-            return False, "TimeoutError"
-        return True, "adm-env"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    first = _send(
-        ctx, target="local-target-0001", message="same body",
-        sender_label="Before", request_id="label-1",
-    )
-    second = _send(
-        ctx, target="local-target-0001", message="same body",
-        sender_label="After", request_id="label-1",
-    )
-    assert first["ok"] is False and first["error"] == "delivery_unknown"
-    assert second["ok"] is True and second["delivery_method"] == "gateway_ws"
-    assert payloads[0] == payloads[1]
-    assert "Before" in payloads[0] and "After" not in payloads[1]
 
 
 def test_r4_card_header_and_custom_reference_are_neutralized(tmp_path: Path) -> None:
@@ -893,9 +677,6 @@ def test_r4_bucket_eviction_drops_the_horizon_and_receipts_are_capped(tmp_path: 
     monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 2)
     plugin.delivery._RECENT_SENDS.clear()
     plugin.delivery._BUCKET_HORIZON.clear()
-    plugin.delivery._RECEIPT_STATUS.clear()
-    plugin.delivery._RECEIPT_OUTCOME.clear()
-    plugin.delivery._RECEIPT_REFERENCE.clear()
     ctx = RecordingContext(home)
     for n in range(4):
         sent = _send(ctx, target=f"local-side-{n:04d}", message=f"body {n}", request_id=f"side-{n}")
@@ -903,9 +684,6 @@ def test_r4_bucket_eviction_drops_the_horizon_and_receipts_are_capped(tmp_path: 
     assert len(plugin.delivery._RECENT_SENDS) <= 2
     assert set(plugin.delivery._BUCKET_HORIZON) <= set(plugin.delivery._RECENT_SENDS)
     assert len(plugin.delivery._OPERATIONS) <= 2
-    assert set(plugin.delivery._RECEIPT_STATUS) <= set(plugin.delivery._OPERATIONS)
-    assert set(plugin.delivery._RECEIPT_OUTCOME) <= set(plugin.delivery._OPERATIONS)
-    assert set(plugin.delivery._RECEIPT_REFERENCE) <= set(plugin.delivery._OPERATIONS)
 
 
 def test_r4_compression_ancestors_do_not_hide_an_older_live_session(tmp_path: Path) -> None:
@@ -973,86 +751,6 @@ def test_r4_reset_prefix_does_not_reach_the_successor(tmp_path: Path) -> None:
     assert resolved is None and ambiguous == []
 
 
-def test_r4_receipt_keeps_outcome_and_reference(tmp_path: Path, monkeypatch) -> None:
-    """R4-STATIC: a terminal receipt is not just a status string.
-
-    completed, cancelled, rejected, failed and interrupted stay distinguishable, and the
-    receipt reference survives next to the admission id.
-    """
-    home, ctx = _routed_pair(tmp_path)
-    ctx.allow_gateway_injection = True
-    ctx._allow_inject = False
-    plugin = _load_plugin()
-
-    def _ws(*_args, **_kwargs):
-        plugin.delivery._RECEIPT_STATUS["receipt-1"] = "terminal"
-        plugin.delivery._RECEIPT_OUTCOME["receipt-1"] = "cancelled"
-        plugin.delivery._RECEIPT_REFERENCE["receipt-1"] = "ref-9"
-        return True, "adm-1"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    result = _send(ctx, target="local-target-0001", message="hello", request_id="receipt-1")
-    assert result["ok"] is True
-    assert result["outcome"] == "cancelled"
-    assert result["reference"] == "ref-9"
-
-
-def test_r4_evicting_an_operation_forgets_its_receipt(tmp_path: Path, monkeypatch) -> None:
-    """R4-STATIC: a receipt lives only as long as its operation.
-
-    The maps are filled by the real submit path, through a fake gateway client, not by the
-    test writing them. A later send that pushes the operation cap past this one must take
-    the receipt with it. A retry of the evicted id must not read the old outcome.
-    """
-    home, ctx = _routed_pair(tmp_path)
-    ctx.allow_gateway_injection = True
-    ctx._allow_inject = False
-    plugin = _load_plugin()
-
-    def _ws(*_args, **kwargs):
-        token = kwargs["request_id"]
-        plugin.delivery._RECEIPT_STATUS[token] = "terminal"
-        plugin.delivery._RECEIPT_OUTCOME[token] = "cancelled"
-        plugin.delivery._RECEIPT_REFERENCE[token] = "ref-9"
-        return True, "adm-1"
-
-    monkeypatch.setattr(plugin.delivery, "submit_via_gateway_ws", _ws)
-    monkeypatch.setattr(plugin.delivery, "_OPERATION_MAX", 4)
-
-    def _send_here(message: str, request_id: str) -> dict:
-        raw = plugin.delivery.tool_session_send(
-            {"target": "local-target-0001", "message": message, "request_id": request_id},
-            ctx=ctx, session_id="local-caller-0001",
-        )
-        return json.loads(raw)
-
-    first = _send_here("hello", "receipt-old")
-    assert first.get("outcome") == "cancelled", first
-
-    second = _send_here("hello again", "receipt-new")
-    assert second["ok"] is True
-
-    third = _send_here("hello once more", "receipt-third")
-    assert third["ok"] is True
-    assert "receipt-old" in plugin.delivery._RECEIPT_OUTCOME
-
-    fourth = _send_here("and once past the cap", "receipt-fourth")
-    assert fourth["ok"] is True
-    assert "receipt-fourth" in plugin.delivery._RECEIPT_OUTCOME
-    # Finished operations stay until the buffer is full of work that is still in doubt. Forgetting
-    # a receipt the moment its operation is evicted is covered by _make_room_for_operation, which
-    # drops the three receipt maps together with the operation (R5-D01).
-    plugin.delivery._OPERATIONS["receipt-old"]["delivered"] = False
-    plugin.delivery._OPERATIONS["receipt-old"]["result"] = {}
-    plugin.delivery._OPERATION_MAX = 1
-    assert plugin.delivery._make_room_for_operation() is False
-    plugin.delivery._OPERATIONS["receipt-old"]["delivered"] = True
-    assert plugin.delivery._make_room_for_operation() is True
-    assert "receipt-old" not in plugin.delivery._RECEIPT_STATUS
-    assert "receipt-old" not in plugin.delivery._RECEIPT_OUTCOME
-    assert "receipt-old" not in plugin.delivery._RECEIPT_REFERENCE
-
-
 def test_r4_an_empty_routing_index_is_not_a_route(tmp_path: Path, monkeypatch) -> None:
     """R5-D04 supersedes R4-D05. An empty gateway_routing table is not evidence of a route.
 
@@ -1062,10 +760,6 @@ def test_r4_an_empty_routing_index_is_not_a_route(tmp_path: Path, monkeypatch) -
     """
     plugin = _load_plugin()
     mounts: list[str] = []
-    monkeypatch.setattr(
-        plugin.delivery, "mount_dormant_local_session",
-        lambda *_a, **_k: mounts.append("mount") or (False, "not mounted"),
-    )
 
     home, ctx = _routed_pair(tmp_path)
     con = sqlite3.connect(str(home / "state.db"))
@@ -1085,16 +779,3 @@ def test_r4_an_empty_routing_index_is_not_a_route(tmp_path: Path, monkeypatch) -
     con.close()
     indexed = _send(ctx, target="local-target-0001", message="again", request_id="indexed-1")
     assert indexed["error"] == "route_unverified", (mounts, indexed)
-
-
-
-
-
-
-
-
-
-
-
-
-

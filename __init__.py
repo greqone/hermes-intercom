@@ -122,11 +122,6 @@ def register(ctx) -> None:
     )
     ctx.register_hook("pre_llm_call", lambda **kw: delivery.on_pre_llm_call(ctx=ctx, **kw))
     try:
-        ctx.on_unload(delivery.shutdown_discovery_executor)
-    except Exception:
-        logger.debug("hermes-intercom: host has no on_unload", exc_info=True)
-
-    try:
         skills_dir = Path(__file__).parent / "skills"
         if skills_dir.is_dir():
             for child in sorted(skills_dir.iterdir()):

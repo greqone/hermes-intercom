@@ -1,3 +1,6 @@
+> Historical integration record for the original submitted candidate.
+> The current public API contract supersedes the gateway-specific decisions below; see [PUBLIC_API_REVIEW.md](PUBLIC_API_REVIEW.md).
+
 # Integration of the independent audit into ROUND7
 
 Base: `3a9de27b94ec66ccb945727f732eeabf12909b72`.

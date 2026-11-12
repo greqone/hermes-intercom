@@ -11,8 +11,9 @@ SESSION_LIST_SCHEMA: dict = {
         "`addressable` is true when the entry has a gateway session_key (explicit, from the routing "
         "table, or synthesized). `routed` is true only when a real route exists — an explicit "
         "session_key or a gateway_routing row — and is false when the key was merely synthesized as "
-        "`agent:<namespace>:local:dm:<session_id>`; such a session must be mounted in the gateway "
-        "authority before a send is accepted."
+        "`agent:<namespace>:local:dm:<session_id>`; an unverified route is refused. "
+        "A route does not guarantee that a dormant target is currently injectable. In a shared "
+        "gateway, results may include other users' chat titles; restrict the intercom toolset to owner-only platforms."
     ),
     "parameters": {
         "type": "object",
@@ -49,12 +50,12 @@ SESSION_SEND_SCHEMA: dict = {
     "name": "session_send",
     "description": (
         "Send a message to another Hermes session in the same profile (by session_id, prefix, session_key, "
-        "or unique title substring). Wakes an idle target session as a new turn or, when the target is "
-        "busy, hands the message to the host scheduler. The result says `scheduled` when the host "
-        "accepted it for scheduling. The gateway WebSocket fallback returns the host's own receipt "
-        "status: `queued`, `started`, `unknown` or `terminal`. Neither is a durable queue and neither promises the turn will run. "
-        "Renders as an attributed agent card in Hermes Desktop. Includes multi-hop "
-        "loop protection so two sessions can exchange a bounded reply without infinite ping-pong."
+        "or unique title substring). Uses only the public ctx.inject_message API. "
+        "Returns scheduled when the host accepts scheduling, not proof of execution or durable "
+        "delivery. Refuses CLI/unknown sender surfaces and unverified routes. It does not mount "
+        "dormant targets or bypass an injection refusal. Shows an attributed native notice in "
+        "Hermes Desktop and enforces hop, duplicate and rate guards. In a shared gateway it can "
+        "start turns in other users' chats; restrict the intercom toolset to owner-only platforms."
     ),
     "parameters": {
         "type": "object",
@@ -83,12 +84,11 @@ SESSION_SEND_SCHEMA: dict = {
                 "type": "string",
                 "description": (
                     "Optional retry identity, 1-1024 characters. While retained, reuse the request_id, "
-                    "body and exact target_session_id from the first result: an inject retry replays "
-                    "the outcome; a gateway retry uses the gateway admission identity. A changed body "
-                    "conflicts. State is process-local, bounded to 4096 entries. Non-active gateway "
-                    "entries older than 120 seconds can be evicted under capacity pressure; completed "
-                    "entries are also evictable. After eviction or restart, check target history before "
-                    "resending because transport identity may be lost. This is not an exactly-once guarantee. "
+                    "body, expect_reply and exact target_session_id from the first result. A retained "
+                    "accepted operation replays its outcome without another injection. A changed body "
+                    "or unrelated sender/target conflicts. State is process-local and bounded to 4096 "
+                    "entries; completed entries are evictable under pressure. After eviction or restart, "
+                    "check target history before resending. This is not an exactly-once guarantee. "
                     "Omit this only for genuinely new work."
                 ),
             },

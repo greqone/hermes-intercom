@@ -1,19 +1,12 @@
 name: hermes-intercom
-version: 0.1.0
+version: 0.1.1
 description: >
-  Cross-session discovery and inter-agent messaging for Hermes Agent (Desktop,
-  TUI, CLI, and messaging channels). Discovers sessions via a read-only, schema
-  tolerant state.db (missing optional columns and compression continuations are
-  handled), reports whether each session has a real gateway route or only a
-  synthesized agent:<ns>:local:dm:<id> key, auto-mounts dormant local
-  (`:local:dm:`) sessions through the profile gateway authority when injection is
-  refused, and for external processes falls back to `prompt.submit` over the
-  local Gateway WebSocket when `allow_gateway_injection: true`. Delivers attributed agent cards through ctx.inject_message with multi-hop loop
-  protection and per-sender, expect_reply-aware deduplication. A classic CLI
-  host (a classic CLI REPL, detected from the host's own CLI reference) cannot honor a session_key, so delivery
-  falls back to the local gateway prompt.submit path instead of the sender's REPL.
-  The desktop half renders nothing: the SDK has no incoming-message slot and
-  catalog rule 8 forbids rewriting the host note.
+  Cross-session discovery and messaging within one Hermes profile. Reads a
+  schema-tolerant state.db and sends attributed messages exclusively through
+  ctx.inject_message, with hop protection, bounded retry identities, duplicate
+  detection and rate limits. Refuses CLI/unknown sender surfaces and unverified
+  or dormant targets that the public API cannot reach. No private gateway
+  transport, automatic mounting, or Desktop DOM modifications.
 author: GreQ, Hermes Agent
 license: MIT
 requires_hermes: ">=0.22.5"
@@ -54,18 +47,3 @@ config_schema:
     minimum: 1
     maximum: 200
     description: Maximum intercom messages from any senders to one target within burst_window_seconds; over-limit sends fail with error=rate_limited
-  auto_mount_dormant:
-    type: bool
-    default: true
-    description: >
-      When ctx.inject_message refuses a `:local:dm:` target, mount that session in
-      the gateway authority (session.resume with omit_messages, then
-      session.detach) and retry the injection once.
-  mount_timeout_seconds:
-    type: float
-    default: 8.0
-    minimum: 1.0
-    maximum: 60.0
-    description: >
-      Overall seconds budget shared by the dormant mount and the external-process WebSocket fallback.
-      A timed-out submit is treated as in-flight so an immediate retry is not delivered twice.

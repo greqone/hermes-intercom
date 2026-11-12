@@ -49,9 +49,6 @@ def _clear_delivery_state() -> None:
         delivery._TURN_HOP.clear()
         delivery._OPERATIONS.clear()
         delivery._BUCKET_HORIZON.clear()
-        delivery._RECEIPT_STATUS.clear()
-        delivery._RECEIPT_OUTCOME.clear()
-        delivery._RECEIPT_REFERENCE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -61,3 +58,32 @@ def _reset_intercom_delivery_state(monkeypatch: pytest.MonkeyPatch):
     _clear_delivery_state()
     yield
     _clear_delivery_state()
+
+
+@pytest.fixture(autouse=True)
+def _emulate_profile_scoped_host_dispatch():
+    """Unit doubles run inside the same public home scope as real host dispatch.
+
+    Do not patch resolve_home: it must call the real public get_hermes_home API.
+    Real PluginManager integration tests bypass this helper (their contexts have
+    no test-only _intercom_test_context flag).
+    """
+    from functools import wraps
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    delivery = importlib.import_module(f"{PACKAGE}.delivery")
+    def scoped(fn):
+        @wraps(fn)
+        def dispatch(*args, **kwargs):
+            ctx = kwargs.get("ctx")
+            if not getattr(ctx, "_intercom_test_context", False):
+                return fn(*args, **kwargs)
+            token = set_hermes_home_override(str(ctx.home_path))
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                reset_hermes_home_override(token)
+        return dispatch
+    with pytest.MonkeyPatch.context() as scope_patch:
+        for name in ("tool_session_list", "tool_session_send", "on_pre_llm_call"):
+            scope_patch.setattr(delivery, name, scoped(getattr(delivery, name)))
+        yield

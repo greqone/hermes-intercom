@@ -70,6 +70,11 @@ def _create_state_db(db_path: Path) -> None:
 
 
 class RecordingContext:
+    _intercom_test_context = True
+
+    def session_surface(self):
+        return "desktop"
+
     def __init__(self, home_path: Path, settings: dict[str, Any] | None = None, allow_inject: bool = True) -> None:
         self.plugin_id = "hermes-intercom"
         self.home_path = home_path
@@ -311,131 +316,6 @@ class _ClassicCliHost:
         return False
 
 
-def test_classic_cli_send_does_not_land_in_the_senders_repl(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A Desktop session B must receive the card; the sender's classic CLI must not.
-
-    Positive control: the same send through a gateway-style injector (the default
-    RecordingContext) queues exactly one payload tagged with B's session_key.
-    """
-    hermes_intercom = _load_plugin()
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, sid_b = _seed_two_sessions(db_path)
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    host = _ClassicCliHost()
-
-    class CliContext(RecordingContext):
-        # The host's real signal: plugins_injection steals the payload only when this is set.
-        _manager = types.SimpleNamespace(_cli_ref=object())
-
-        def inject_message(self, content: str, role: str = "user", *, session_key: str | None = None, origin: Any = None) -> bool:
-            self.injected.append({"content": content, "role": role, "session_key": session_key, "origin": origin})
-            return host.inject_message(content, role, session_key=session_key, origin=origin)
-
-    delivered: list[tuple[str, str]] = []
-
-    def fake_ws(home_dir: Path, target_sid: str, content: str, *, timeout: float = 8.0, request_id: str = ""):
-        delivered.append((target_sid, content))
-        return True, "admitted"
-
-    monkeypatch.setattr(hermes_intercom.delivery, "submit_via_gateway_ws", fake_ws)
-    monkeypatch.setattr(
-        hermes_intercom.delivery, "mount_dormant_local_session", lambda *a, **kw: (False, "not_needed")
-    )
-
-    ctx = CliContext(home, allow_inject=True)
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-    res = json.loads(
-        ctx.tools["session_send"]["handler"](
-            {"target": sid_b, "message": "for B only"}, session_id=sid_a
-        )
-    )
-    assert res["ok"] is True, res
-    assert res["target_session_id"] == sid_b
-    assert res["delivery_method"] == "gateway_ws"
-    assert host.local_queue == [], "payload was delivered to the sender's own CLI REPL"
-    assert delivered and delivered[0][0] == sid_b and "for B only" in delivered[0][1]
-
-    # The same host with the gateway gate closed must refuse instead of lying.
-    closed = CliContext(home)
-    closed.allow_gateway_injection = False  # type: ignore[attr-defined]
-    hermes_intercom.register(closed)
-    refused = json.loads(
-        closed.tools["session_send"]["handler"](
-            {"target": sid_b, "message": "for B only, second"}, session_id=sid_a
-        )
-    )
-    assert refused["ok"] is False and refused["error"] == "surface_cannot_route"
-    assert host.local_queue == []
-
-    control = RecordingContext(home)
-    hermes_intercom.register(control)
-    control_res = json.loads(
-        control.tools["session_send"]["handler"](
-            {"target": sid_b, "message": "for B only, via gateway"}, session_id=sid_a
-        )
-    )
-    assert control_res["ok"] is True
-    assert len(control.injected) == 1
-    assert control.injected[0]["session_key"].endswith(sid_b)
-
-
-
-def test_cli_surface_without_a_classic_repl_still_uses_the_gateway_injector(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A gateway turn can report surface 'cli' while _cli_ref stays None.
-
-    That turn's injector honors session_key, so refusing it would drop a working route.
-    The target here is a messaging session: the WS fallback only covers :local:dm:.
-    """
-    hermes_intercom = _load_plugin()
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, _sid_b = _seed_two_sessions(db_path)
-    telegram = "telegram-" + "9" * 16
-    con = sqlite3.connect(str(db_path))
-    con.execute(
-        "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason,"
-        " message_count, cwd, title, archived, hidden, session_key, last_activity_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (telegram, "telegram", "m", None, 1, None, None, 4, "", "Ops channel", 0, 0,
-         "agent:main:telegram:dm:ops", 1800.0),
-    )
-    con.execute(
-        "INSERT INTO gateway_routing (session_key, entry_json) VALUES (?, ?)",
-        ("agent:main:telegram:dm:ops", json.dumps({"session_id": telegram})),
-    )
-    con.commit()
-    con.close()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    class GatewayCliSurface(RecordingContext):
-        _manager = types.SimpleNamespace(_cli_ref=None)
-
-        def session_surface(self) -> str:
-            return "cli"
-
-    ctx = GatewayCliSurface(home)
-    hermes_intercom.register(ctx)
-    res = json.loads(
-        ctx.tools["session_send"]["handler"](
-            {"target": telegram, "message": "ping ops"}, session_id=sid_a
-        )
-    )
-    assert res["ok"] is True, res
-    assert res["delivery_method"] == "inject_message"
-    assert ctx.injected[0]["session_key"] == "agent:main:telegram:dm:ops"
-
-
 def test_session_send_formats_desktop_card_and_blocks_self_and_duplicates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -529,44 +409,6 @@ def test_multihop_loop_guard_allows_reply_then_stops_at_max_hops(
     assert r3["max_hops"] == 2
 
 
-def test_dormant_local_session_auto_mounts_then_injects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    hermes_intercom = _load_plugin()
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, sid_b = _seed_two_sessions(db_path)
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    mounted_sessions: list[str] = []
-
-    class DormantUntilMountedContext(RecordingContext):
-        def inject_message(self, content: str, role: str = "user", *, session_key: str | None = None, origin: Any = None) -> bool:
-            if sid_b not in mounted_sessions:
-                return False
-            return super().inject_message(content, role, session_key=session_key, origin=origin)
-
-    ctx = DormantUntilMountedContext(home)
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-
-    def fake_mount(home_dir: Path, target_sid: str, *, timeout: float = 8.0) -> tuple[bool, str]:
-        assert home_dir == home.resolve()
-        assert target_sid == sid_b
-        mounted_sessions.append(target_sid)
-        return True, "mounted"
-
-    monkeypatch.setattr(hermes_intercom.delivery, "mount_dormant_local_session", fake_mount)
-    send_fn = ctx.tools["session_send"]["handler"]
-
-    res = json.loads(send_fn({"target": sid_b, "message": "wake up Neo"}, session_id=sid_a))
-    assert res["ok"] is True
-    assert res["mounted_dormant"] is True
-    assert len(ctx.injected) == 1
-
-
 def test_resilient_per_key_settings_and_rate_limiting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,54 +452,6 @@ def test_resilient_per_key_settings_and_rate_limiting(
     assert r2["ok"] is True
     assert r3["ok"] is False
     assert r3["error"] == "rate_limited"
-
-
-def test_external_process_ws_submit_fallback_respects_injection_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    hermes_intercom = _load_plugin()
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, sid_b = _seed_two_sessions(db_path)
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    # Context where in-process inject_message always returns False (like a standalone CLI/kernel process)
-    ctx_denied = RecordingContext(home, allow_inject=False)
-    ctx_denied.allow_gateway_injection = False  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx_denied)
-
-    ws_calls: list[tuple[str, str]] = []
-
-    def fake_ws_submit(home_dir: Path, target_sid: str, content: str, *, timeout: float = 8.0, request_id: str = "") -> tuple[bool, str]:
-        ws_calls.append((target_sid, content))
-        return True, "submitted_via_ws"
-
-    monkeypatch.setattr(hermes_intercom.delivery, "submit_via_gateway_ws", fake_ws_submit)
-    monkeypatch.setattr(hermes_intercom.delivery, "mount_dormant_local_session", lambda *a, **kw: (False, "no_inproc"))
-
-    # 1. When allow_gateway_injection is False, WS fallback must NOT be called (fail-closed)
-    res_denied = json.loads(
-        ctx_denied.tools["session_send"]["handler"]({"target": sid_b, "message": "blocked"}, session_id=sid_a)
-    )
-    assert res_denied["ok"] is False
-    assert res_denied["error"] == "injection_refused"
-    assert len(ws_calls) == 0
-
-    # 2. When allow_gateway_injection is True, WS fallback delivers the message
-    ctx_allowed = RecordingContext(home, allow_inject=False)
-    ctx_allowed.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx_allowed)
-    res_ok = json.loads(
-        ctx_allowed.tools["session_send"]["handler"]({"target": sid_b, "message": "hello via ws"}, session_id=sid_a)
-    )
-    assert res_ok["ok"] is True
-    assert res_ok["delivery_method"] == "gateway_ws"
-    assert len(ws_calls) == 1
-    assert ws_calls[0][0] == sid_b
-    assert "hello via ws" in ws_calls[0][1]
 
 
 # --------------------------------------------------------------------------------------
@@ -883,62 +677,6 @@ def _install_fake_gateway(monkeypatch: pytest.MonkeyPatch, *, detach_raises: boo
     return calls
 
 
-def test_mount_dormant_local_session_tolerates_detach_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    hermes_intercom = _load_plugin()
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    _create_state_db(home / "state.db")
-    _sid_a, sid_b = _seed_two_sessions(home / "state.db")
-
-    calls = _install_fake_gateway(monkeypatch, detach_raises=True)
-
-    mounted, info = hermes_intercom.delivery.mount_dormant_local_session(home, sid_b, timeout=2.0)
-    assert mounted is True, f"detach failure after a good resume must not fail the mount: {info!r}"
-    assert info == sid_b
-    assert [method for method, _ in calls] == ["session.resume", "session.detach"]
-
-
-def test_ws_submit_runs_even_when_auto_mount_dormant_is_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    hermes_intercom = _load_plugin()
-    delivery = hermes_intercom.delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    _create_state_db(home / "state.db")
-    sid_a, sid_b = _seed_two_sessions(home / "state.db")
-
-    calls = _install_fake_gateway(monkeypatch)
-
-    # Direct call: the gateway WS path works on its own.
-    ok, info = delivery.submit_via_gateway_ws(home, sid_b, "direct submit", timeout=2.0)
-    assert ok is True and info == "adm-42"
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    ctx = RecordingContext(home, settings={"auto_mount_dormant": False}, allow_inject=False)
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-
-    def _must_not_mount(*_a: Any, **_kw: Any) -> tuple[bool, str]:
-        raise AssertionError("dormant mount must not run when auto_mount_dormant is False")
-
-    monkeypatch.setattr(delivery, "mount_dormant_local_session", _must_not_mount)
-
-    res = json.loads(
-        ctx.tools["session_send"]["handler"]({"target": sid_b, "message": "hello over ws"}, session_id=sid_a)
-    )
-    assert res["ok"] is True
-    assert res["delivery_method"] == "gateway_ws"
-    assert res["mounted_dormant"] is False
-
-    submitted = [payload for method, payload in calls if method == "prompt.submit"]
-    assert len(submitted) == 2  # the direct call above plus the tool-level delivery
-    delivered = [payload for payload in submitted if "hello over ws" in payload["text"]]
-    assert len(delivered) == 1
-
-
 def test_read_settings_rejects_bools_and_non_finite_numbers(tmp_path: Path) -> None:
     hermes_intercom = _load_plugin()
     delivery = hermes_intercom.delivery
@@ -960,8 +698,8 @@ def test_read_settings_rejects_bools_and_non_finite_numbers(tmp_path: Path) -> N
     assert cfg["dedup_window_seconds"] == 120
     assert cfg["burst_window_seconds"] == 600
     assert cfg["max_messages_per_window"] == 10
-    assert cfg["mount_timeout_seconds"] == 8.0
-    assert cfg["auto_mount_dormant"] is False
+    assert "mount_timeout_seconds" not in cfg
+    assert "auto_mount_dormant" not in cfg
 
     # Direct value handling
     assert delivery._pos_int(float("inf"), 7) == 7
@@ -1179,57 +917,6 @@ def test_compression_continuation_without_session_key_is_listed_and_routable(
     assert item["session_key"] == f"agent:main:local:dm:{child}"
 
 
-def test_unrouted_local_dm_target_mounts_before_inject_message(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """W202: core returns True for unknown keys and drops them, so mount must run first."""
-    hermes_intercom = _load_plugin()
-    delivery = hermes_intercom.delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, _sid_b = _seed_two_sessions(db_path)
-    child = _insert_session(
-        db_path,
-        id=SID_E,
-        parent_session_id=sid_a,
-        title="Continuation of Alpha",
-        message_count=4,
-        last_activity_at=1800.0,
-    )
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    events: list[str] = []
-
-    class OrderedContext(RecordingContext):
-        def inject_message(
-            self, content: str, role: str = "user", *, session_key: str | None = None, origin: Any = None
-        ) -> bool:
-            events.append("inject")
-            return super().inject_message(content, role, session_key=session_key, origin=origin)
-
-    ctx = OrderedContext(home)
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-
-    def fake_mount(home_dir: Path, target_sid: str, *, timeout: float = 8.0) -> tuple[bool, str]:
-        assert home_dir == home.resolve()
-        assert target_sid == child
-        events.append("mount")
-        return True, child
-
-    monkeypatch.setattr(delivery, "mount_dormant_local_session", fake_mount)
-
-    res = json.loads(
-        ctx.tools["session_send"]["handler"]({"target": child, "message": "wake up"}, session_id=sid_a)
-    )
-    assert res["ok"] is True, res
-    assert res["mounted_dormant"] is True
-    assert events == ["mount", "inject"], f"mount must precede inject_message for unrouted targets: {events}"
-
-
 def test_hop_guard_recovers_caller_sid_from_session_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1260,8 +947,6 @@ def test_hop_guard_recovers_caller_sid_from_session_key(
     assert res["hop"] == 3
 
 
-
-
 def test_a_quoted_card_cannot_raise_the_hop_of_a_leading_card() -> None:
     """A body may quote an intercom card. Only a card that leads the text sets the hop."""
     store = _load_plugin().store
@@ -1279,7 +964,6 @@ def test_a_quoted_card_cannot_raise_the_hop_of_a_leading_card() -> None:
     assert store.parse_intercom_tag(prepended) == (1, 3)
     # Ordinary prose before a card is a person quoting it, which must not move the hop.
     assert store.parse_intercom_tag("what about this?" + chr(10) + real) == (0, 0)
-
 
 
 def test_stored_card_keeps_its_lower_hop_budget_without_the_memory_cache(
@@ -1431,9 +1115,6 @@ def test_reply_to_compressed_ancestor_id_resolves_live_continuation(
     monkeypatch.setenv("HERMES_HOME", str(home))
     ctx = RecordingContext(home)
     hermes_intercom.register(ctx)
-    monkeypatch.setattr(
-        delivery, "mount_dormant_local_session", lambda *a, **kw: (False, "no_gateway_in_tests")
-    )
 
     res = json.loads(
         ctx.tools["session_send"]["handler"]({"target": ancestor, "message": "still there?"}, session_id=sid_a)
@@ -1509,106 +1190,6 @@ def test_lone_surrogate_in_message_and_label_does_not_raise(
     assert "\ud800" not in injected and "\udfff" not in injected
     assert "hello" in injected and "world" in injected
     injected.encode("utf-8")  # the delivered card must be encodable
-
-
-def test_pre_submit_ws_timeout_rolls_back_dedup_while_post_submit_keeps_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """W212: only provable pre-submit failures may release the dedup reservation."""
-    hermes_intercom = _load_plugin()
-    delivery = hermes_intercom.delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, sid_b = _seed_two_sessions(db_path)
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    ctx = RecordingContext(home, allow_inject=False)
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-    send_fn = ctx.tools["session_send"]["handler"]
-
-    monkeypatch.setattr(delivery, "mount_dormant_local_session", lambda *a, **kw: (False, "no_inproc"))
-
-    ws_results: list[tuple[bool, str]] = [(False, "pre_submit:TimeoutError")]
-
-    def fake_ws_submit(home_dir: Path, target_sid: str, content: str, *, timeout: float = 8.0, request_id: str = "") -> tuple[bool, str]:
-        return ws_results[-1]
-
-    monkeypatch.setattr(delivery, "submit_via_gateway_ws", fake_ws_submit)
-
-    first = json.loads(send_fn({"target": sid_b, "message": "pre submit body"}, session_id=sid_a))
-    assert first["ok"] is False and first["error"] == "injection_refused"
-    assert first["ws_error"] == "pre_submit:TimeoutError"
-
-    retry = json.loads(send_fn({"target": sid_b, "message": "pre submit body"}, session_id=sid_a))
-    assert retry["error"] == "injection_refused", "a pre-submit failure must roll back the dedup entry"
-
-    ws_results.append((False, "TimeoutError"))
-    post = json.loads(send_fn({"target": sid_b, "message": "post submit body"}, session_id=sid_a))
-    assert post["ok"] is False and post["ws_error"] == "TimeoutError"
-
-    duplicate = json.loads(send_fn({"target": sid_b, "message": "post submit body"}, session_id=sid_a))
-    assert duplicate["error"] == "duplicate_message", "a post-submit timeout may still land; keep the entry"
-
-    ws_results.append((False, "ConnectionClosedError"))
-    dropped = json.loads(send_fn({"target": sid_b, "message": "transport drop body"}, session_id=sid_a))
-    assert dropped["ok"] is False and dropped["ws_error"] == "ConnectionClosedError"
-
-    dropped_retry = json.loads(send_fn({"target": sid_b, "message": "transport drop body"}, session_id=sid_a))
-    assert dropped_retry["error"] == "duplicate_message", "a post-submit transport drop may still land"
-
-
-def test_ws_submit_classifies_pre_submit_failures_and_keeps_admission_receipts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """W212c/W211b: prefix pre-submit errors, and never lose a real admission receipt."""
-    delivery = _load_plugin().delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    _create_state_db(home / "state.db")
-    _sid_a, sid_b = _seed_two_sessions(home / "state.db")
-
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    _install_scripted_gateway(monkeypatch, _ScriptedGatewayClient(calls, fail_resume=True))
-    ok, label = delivery.submit_via_gateway_ws(home, sid_b, "pre", timeout=2.0)
-    assert ok is False
-    assert label == "pre_submit:TimeoutError", label
-
-    _install_scripted_gateway(monkeypatch, _ScriptedGatewayClient(calls, fail_submit=True))
-    ok, label = delivery.submit_via_gateway_ws(home, sid_b, "during", timeout=2.0)
-    assert ok is False
-    assert label == "TimeoutError", label
-
-    _install_scripted_gateway(monkeypatch, _ScriptedGatewayClient(calls, fail_detach=True))
-    ok, label = delivery.submit_via_gateway_ws(home, sid_b, "after", timeout=2.0)
-    assert ok is True, label
-    assert label == "adm-42"
-
-
-def test_ws_submit_works_from_inside_a_running_event_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """W211a/c: a synchronous tool call made inside the gateway loop must not deadlock."""
-    delivery = _load_plugin().delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    _create_state_db(home / "state.db")
-    _sid_a, sid_b = _seed_two_sessions(home / "state.db")
-
-    calls: list[tuple[str, dict[str, Any]]] = []
-    _install_scripted_gateway(monkeypatch, _ScriptedGatewayClient(calls))
-
-    async def _caller() -> tuple[bool, str]:
-        return delivery.submit_via_gateway_ws(home, sid_b, "loop submit", timeout=2.0)
-
-    ok, info = asyncio.run(_caller())
-    assert ok is True, info
-    assert info == "adm-42"
-    assert [method for method, _ in calls] == ["session.resume", "prompt.submit", "session.detach"]
-
 
 
 def test_an_unreadable_store_is_not_reported_as_an_empty_list(
@@ -1740,87 +1321,6 @@ def test_hop_memory_and_send_buckets_stay_bounded(tmp_path: Path) -> None:
         assert ("h", "target") in delivery._RECENT_SENDS, "a 1s caller must not evict a 600s bucket"
 
 
-def test_a_second_call_without_request_id_is_not_the_same_operation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """B03: the public contract must reuse a caller-supplied request id.
-
-    A fresh uuid minted inside every call, and a schema that never accepts one,
-    cannot collapse an ambiguous retry. Two different operations stay two ids.
-    """
-    hermes_intercom = _load_plugin()
-    delivery = hermes_intercom.delivery
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    db_path = home / "state.db"
-    _create_state_db(db_path)
-    sid_a, sid_b = _seed_two_sessions(db_path)
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    ctx = RecordingContext(
-        home,
-        settings={"max_messages_per_window": 10, "auto_mount_dormant": True},
-        allow_inject=False,
-    )
-    ctx.allow_gateway_injection = True  # type: ignore[attr-defined]
-    hermes_intercom.register(ctx)
-    send_fn = ctx.tools["session_send"]["handler"]
-    schema = ctx.tools["session_send"]["schema"]["parameters"]["properties"]
-    assert "request_id" in schema, "the public schema never accepts a retry identity"
-
-    con = sqlite3.connect(str(db_path))
-    con.execute("UPDATE sessions SET session_key = NULL WHERE id = ?", (sid_b,))
-    con.commit()
-    con.close()
-
-    seen: list[str] = []
-
-    def fake_ws_submit(
-        home_dir: Path, target_sid: str, content: str, *, timeout: float = 8.0, request_id: str = ""
-    ) -> tuple[bool, str]:
-        seen.append(request_id)
-        return True, "admission-1"
-
-    monkeypatch.setattr(delivery, "submit_via_gateway_ws", fake_ws_submit)
-    monkeypatch.setattr(delivery, "mount_dormant_local_session", lambda *a, **kw: (False, "no_inproc"))
-
-    token = "retry-token-stable"
-    first = json.loads(
-        send_fn(
-            {"target": sid_b, "message": "same body", "request_id": token},
-            session_id=sid_a,
-        )
-    )
-    assert first["ok"] is True, first
-    assert first["request_id"] == token
-    assert seen == [token]
-
-    # The process-local dedup window must not swallow a genuine retry of the
-    # same operation: the gateway's admission key is what collapses it.
-    delivery._RECENT_SENDS.clear()
-    seen.clear()
-    again = json.loads(
-        send_fn(
-            {"target": sid_b, "message": "same body", "request_id": token},
-            session_id=sid_a,
-        )
-    )
-    assert again["ok"] is True, again
-    assert again["request_id"] == token
-    assert seen == [token], "the second call minted a new id instead of reusing the caller's"
-
-    seen.clear()
-    other = json.loads(
-        send_fn(
-            {"target": sid_b, "message": "different body", "request_id": "retry-token-other"},
-            session_id=sid_a,
-        )
-    )
-    assert other["ok"] is True, other
-    assert other["request_id"] == "retry-token-other"
-    assert seen == ["retry-token-other"]
-
-
 def test_a_second_active_title_outside_the_window_is_not_unique(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1876,5 +1376,3 @@ def test_a_second_active_title_outside_the_window_is_not_unique(
     assert res["error"] == "ambiguous_target", res
     ids = {c["session_id"] for c in res["candidates"]}
     assert recent in ids and hidden in ids, ids
-
-
