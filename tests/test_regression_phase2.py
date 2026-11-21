@@ -803,14 +803,14 @@ def test_h2_root_prefix_beats_a_title_that_contains_it(tmp_path: Path) -> None:
 
     sessions.title exists, so the key/root SQL predicate used to be discarded and the
     Python loop only prefixed session_id. ``local-abcdef`` then selected the decoy.
+    The shortened root stays unresolved; it does not select the live successor.
     """
     home = _home(tmp_path)
     _insert(home, _compression_root_rows(decoy=True))
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "local-abcdef")
     assert ambiguous == []
-    assert (resolved or {}).get("session_id") != "local-decoy000001"
-    assert resolved is None or resolved["session_id"] == "local-zzzzzzzzzzzz"
+    assert resolved is None
     titled, titled_ambiguous = plugin.store.resolve_target(home, "notes about local-abcdef")
     assert titled_ambiguous == []
     assert titled["session_id"] == "local-decoy000001"
@@ -823,7 +823,7 @@ def test_h2_root_prefix_without_a_decoy_does_not_become_a_title(tmp_path: Path) 
     plugin = _load_plugin()
     resolved, ambiguous = plugin.store.resolve_target(home, "local-abcdef")
     assert ambiguous == []
-    assert resolved is None or resolved["session_id"] == "local-zzzzzzzzzzzz"
+    assert resolved is None
 
 
 # --- H1: per-user boundary -------------------------------------------------
@@ -993,3 +993,46 @@ def test_h1_other_users_cannot_fill_the_list_window(tmp_path: Path, monkeypatch)
     assert listed["ok"] is True
     assert [row["session_id"] for row in listed["sessions"]] == ["local-alice-0001"]
     assert "Bob 500" not in json.dumps(listed)
+
+
+def test_h1_a_principal_committed_during_the_read_is_not_listed(tmp_path: Path, monkeypatch) -> None:
+    """The user count and the session read share one snapshot.
+
+    A second principal that commits after the count must not appear in that read.
+    """
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-alice-0001", "local", "m", None, 1.0, None, None, 1, "Alice", 0,
+         "agent:main:local:dm:local-alice-0001", 9.0),
+    ])
+    _set_users(home, {"local-alice-0001": "basic:alice"})
+    setup = sqlite3.connect(str(home / "state.db"))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.close()
+    plugin = _load_plugin()
+    real = plugin.store._multiple_users
+    writer = sqlite3.connect(str(home / "state.db"))
+    inserted = False
+
+    def gap(db):
+        nonlocal inserted
+        flag = real(db)
+        if not inserted:
+            writer.execute(
+                "INSERT INTO sessions (id, source, user_id, title, message_count, session_key, last_activity_at) "
+                "VALUES ('local-bob-000001', 'telegram', 'basic:bob', 'Bob private notes', 1, "
+                "'agent:main:telegram:dm:bob', 20.0)"
+            )
+            writer.commit()
+            inserted = True
+        return flag
+
+    monkeypatch.setattr(plugin.store, "_multiple_users", gap)
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    try:
+        listed = _list(RecordingContext(home), caller="local-alice-0001")
+    finally:
+        writer.close()
+    assert listed["ok"] is True
+    assert [row["session_id"] for row in listed["sessions"]] == ["local-alice-0001"]
+    assert "Bob private notes" not in json.dumps(listed)

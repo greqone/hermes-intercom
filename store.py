@@ -145,6 +145,26 @@ def _multiple_users(con: sqlite3.Connection) -> bool:
     return _safe_int(_row_get(row, "n") if row is not None else 0, 0) > 1
 
 
+def _begin_read(con: sqlite3.Connection) -> None:
+    """Keep every later statement on this connection's first-read snapshot.
+
+    Autocommit would let a second principal commit between the user count and the
+    session read that is supposed to obey it.
+    """
+    con.execute("BEGIN")
+
+
+def _note_shared(con: sqlite3.Connection, box: list[bool] | None) -> None:
+    """Record whether this snapshot holds more than one principal."""
+    if box is None:
+        return
+    flag = _multiple_users(con)
+    if box:
+        box[0] = flag
+    else:
+        box.append(flag)
+
+
 def session_owned_by(item: dict[str, Any], caller_user_id: str) -> bool:
     """True when ``item``'s stored principal is the caller's and neither is empty."""
     caller = _principal(caller_user_id)
@@ -371,6 +391,7 @@ def query_sessions(
     caller_user_id: str | None = None,
     _max_limit: int = 100,
     _with_internal: bool = False,
+    _shared: list[bool] | None = None,
 ) -> list[dict[str, Any]]:
     """List addressable sessions from a read-only ``state.db``.
 
@@ -400,6 +421,7 @@ def query_sessions(
     sid_to_key: dict[str, str] = {}
     try:
         con = _connect_ro(db_path)
+        _begin_read(con)
         columns = _column_names(con, "sessions")
         if not columns:
             return []
@@ -407,8 +429,10 @@ def query_sessions(
         if "id" not in colset:
             return []
         sid_to_key, _key_to_entry = _load_routing_map(con, home)
+        _note_shared(con, _shared)
+        shared_now = _shared[0] if _shared else _multiple_users(con)
         bound_principal = ""
-        if caller_user_id is not None and _multiple_users(con):
+        if caller_user_id is not None and shared_now:
             bound_principal = _principal(caller_user_id)
             if not bound_principal:
                 raise UserBoundaryError("shared profile has no caller principal")
@@ -703,6 +727,7 @@ def _same_title(left: str, right: str) -> bool:
 def _ancestor_descendants(
     home: Path, needle_low: str, all_sessions: list[dict[str, Any]], *,
     ns: str = "main", caller_session_id: str = "", caller_session_key: str = "",
+    _shared: list[bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Read the actual compression lineage, without route dedup or a recency window.
 
@@ -716,6 +741,8 @@ def _ancestor_descendants(
     con: sqlite3.Connection | None = None
     try:
         con = _connect_ro(db_path)
+        _begin_read(con)
+        _note_shared(con, _shared)
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if not {"id", "parent_session_id", "end_reason"} <= colset:
             return []
@@ -836,11 +863,12 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
     probe_pending = _shared is not None and not _shared
     try:
         con = _connect_ro(db_path)
+        _begin_read(con)
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if probe_pending:
             # Same connection the exact read already holds. A second open would move
             # a later routing failure in front of the claim (R5-D03).
-            _shared.append(_multiple_users(con))
+            _note_shared(con, _shared)
             probe_pending = False
         if "id" not in colset:
             return None
@@ -920,7 +948,8 @@ def _store_looks_like_id(needle_low: str) -> bool:
 
 
 def _scan_title_and_prefix(
-    home: Path, needle: str, needle_low: str, *, ns: str, caller_session_id: str, caller_session_key: str
+    home: Path, needle: str, needle_low: str, *, ns: str, caller_session_id: str, caller_session_key: str,
+    _shared: list[bool] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """Every active-or-not row whose id prefix or title matches ``needle``.
 
@@ -944,6 +973,8 @@ def _scan_title_and_prefix(
     root_shadow = False
     try:
         con = _connect_ro(db_path)
+        _begin_read(con)
+        _note_shared(con, _shared)
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if "id" not in colset:
             return [], [], False
@@ -1055,7 +1086,7 @@ def resolve_target(
     # Resolve physical compression edges before any route-key deduplication.
     descendants = _ancestor_descendants(
         home, needle_low, [], ns=ns, caller_session_id=caller_session_id,
-        caller_session_key=caller_session_key,
+        caller_session_key=caller_session_key, _shared=_shared,
     )
     if len(descendants) == 1:
         return descendants[0], []
@@ -1075,6 +1106,7 @@ def resolve_target(
         include_archived=True,
         _max_limit=5000,
         _with_internal=True,
+        _shared=_shared,
     )
 
     # Tier 1 - exact session id / gateway session key. The root id is excluded on purpose:
@@ -1097,7 +1129,7 @@ def resolve_target(
 
     prefix_hits, title_hits, root_shadow = _scan_title_and_prefix(
         home, needle, needle_low, ns=ns, caller_session_id=caller_session_id,
-        caller_session_key=caller_session_key,
+        caller_session_key=caller_session_key, _shared=_shared,
     )
 
     # Tier 2 - unique id/root-id prefix of at least MIN_ID_PREFIX_LEN characters.
