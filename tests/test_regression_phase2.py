@@ -947,6 +947,30 @@ def test_h1_one_principal_stays_a_single_owner_profile(tmp_path: Path) -> None:
     assert {row["session_id"] for row in listed["sessions"]} == {"local-alice-0001", "local-anon-00001"}
 
 
+def test_h1_a_failed_shared_probe_does_not_deliver(tmp_path: Path, monkeypatch) -> None:
+    """A SQLite error while reading the user boundary must not look like a single-owner profile.
+
+    lookup_exact_session used to swallow that error and leave the shared flag unset. A later
+    read could then resolve another user's session and session_send would inject it.
+    """
+    _home_unused, ctx = _shared_pair(tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    plugin = _load_plugin()
+
+    def boom(_con):
+        raise sqlite3.OperationalError("shared probe failed")
+
+    monkeypatch.setattr(plugin.store, "_multiple_users", boom)
+    refused = _send(
+        ctx, target="local-bob-000001", message="hello", caller="local-alice-0001", request_id="probe",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "store_unreadable"
+    assert ctx.injected == []
+    assert "Bob private notes" not in json.dumps(refused)
+    assert "/home/bob/secret" not in json.dumps(refused)
+
+
 def test_h1_other_users_cannot_fill_the_list_window(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
     con = sqlite3.connect(str(home / "state.db"))

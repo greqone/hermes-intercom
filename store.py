@@ -824,20 +824,24 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
 
     ``query_sessions`` only scans the most recent rows, so an old session would otherwise be
     unreachable by the exact id its owner still has. Returns None for anything that is not an
-    exact match, leaving prefix and title resolution to the bounded scan.
+    exact match, leaving prefix and title resolution to the bounded scan. A later read error
+    on that path stays a miss. A failure while recording ``_shared`` does not: callers would
+    otherwise treat an unread boundary as a single-owner profile and deliver anyway.
     """
     db_path = Path(home) / "state.db"
     text = (needle or "").strip()
     if not text or not db_path.is_file():
         return None
     con: sqlite3.Connection | None = None
+    probe_pending = _shared is not None and not _shared
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
-        if _shared is not None and not _shared:
+        if probe_pending:
             # Same connection the exact read already holds. A second open would move
             # a later routing failure in front of the claim (R5-D03).
             _shared.append(_multiple_users(con))
+            probe_pending = False
         if "id" not in colset:
             return None
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
@@ -881,7 +885,9 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
             row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
             caller_session_key=caller_session_key,
         )
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if probe_pending:
+            raise StoreReadError(str(exc)) from exc
         return None
     finally:
         if con is not None:
