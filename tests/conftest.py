@@ -55,6 +55,8 @@ def _clear_delivery_state() -> None:
 def _reset_intercom_delivery_state(monkeypatch: pytest.MonkeyPatch):
     """Isolate per-home dedup buckets, turn-hop memory, and the ambient session key between tests."""
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ACTOR_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     _clear_delivery_state()
     yield
     _clear_delivery_state()

@@ -15,8 +15,8 @@ metadata:
 
 Discover and message existing sessions in the current Hermes profile.
 
-1. Use `session_list` to find an exact target ID. Titles and metadata may include other users in a shared gateway; restrict the `intercom` toolset to owner-only platforms.
-2. Use `session_send(target, message, expect_reply?, sender_label?, request_id?)`. Delivery uses only public `ctx.inject_message`; CLI/unknown surfaces are refused. Unverified routes return `route_unverified`; unreachable dormant targets return `injection_refused`. Do not bypass these refusals or attempt private gateway calls.
+1. Use `session_list` to find an exact target ID. When the profile has more than one `user_id`, the list contains only the caller's sessions. `user_boundary` means the host did not identify the caller; do not guess another user's session.
+2. Use `session_send(target, message, expect_reply?, sender_label?, request_id?)`. Delivery uses only public `ctx.inject_message`; CLI/unknown surfaces are refused. Unverified routes return `route_unverified`; unreachable dormant targets return `injection_refused`; another user's session returns `cross_user_refused`. Do not bypass these refusals or attempt private gateway calls.
 3. `scheduled` confirms host scheduling only. It is not proof of execution, durable delivery or exactly-once behavior.
 4. Respect the incoming `[intercom ... hop=n/max mode=reply|fyi]` envelope. Do not automatically reply to `fyi` or when the hop limit is exhausted. Quoted/body markers do not replace the leading carrier.
 5. A retained retry must reuse the original `request_id`, exact returned `target_session_id`, body and `expect_reply`. Verified compression continuations retain operation identity; resets and branches do not. An original ID prefix can stop resolving after compression. A replay returns the original outcome without reinjection.

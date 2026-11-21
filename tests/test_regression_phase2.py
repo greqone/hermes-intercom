@@ -779,3 +779,260 @@ def test_r4_an_empty_routing_index_is_not_a_route(tmp_path: Path, monkeypatch) -
     con.close()
     indexed = _send(ctx, target="local-target-0001", message="again", request_id="indexed-1")
     assert indexed["error"] == "route_unverified", (mounts, indexed)
+
+
+# --- H2: root-id prefix must beat a title ---------------------------------
+
+
+def _compression_root_rows(decoy: bool) -> list[tuple]:
+    key = "agent:main:local:dm:local-abcdef123456"
+    rows = [
+        ("local-abcdef123456", "local", "m", None, 1.0, 2.0, "compression", 1, "Ancestor", 0, key, 2.0),
+        ("local-zzzzzzzzzzzz", "local", "m", "local-abcdef123456", 3.0, None, None, 1, "Live", 0, key, 9.0),
+    ]
+    if decoy:
+        rows.append((
+            "local-decoy000001", "local", "m", None, 1.0, None, None, 1,
+            "notes about local-abcdef", 0, "agent:main:local:dm:local-decoy000001", 8.0,
+        ))
+    return rows
+
+
+def test_h2_root_prefix_beats_a_title_that_contains_it(tmp_path: Path) -> None:
+    """A prefix of the compression root must not resolve through a title substring.
+
+    sessions.title exists, so the key/root SQL predicate used to be discarded and the
+    Python loop only prefixed session_id. ``local-abcdef`` then selected the decoy.
+    The shortened root stays unresolved; it does not select the live successor.
+    """
+    home = _home(tmp_path)
+    _insert(home, _compression_root_rows(decoy=True))
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-abcdef")
+    assert ambiguous == []
+    assert resolved is None
+    titled, titled_ambiguous = plugin.store.resolve_target(home, "notes about local-abcdef")
+    assert titled_ambiguous == []
+    assert titled["session_id"] == "local-decoy000001"
+
+
+def test_h2_root_prefix_without_a_decoy_does_not_become_a_title(tmp_path: Path) -> None:
+    """With no decoy the shortened root stays unresolved. It must not grow a title match."""
+    home = _home(tmp_path)
+    _insert(home, _compression_root_rows(decoy=False))
+    plugin = _load_plugin()
+    resolved, ambiguous = plugin.store.resolve_target(home, "local-abcdef")
+    assert ambiguous == []
+    assert resolved is None
+
+
+# --- H1: per-user boundary -------------------------------------------------
+
+
+def _set_users(home: Path, users: dict[str, str | None]) -> None:
+    con = sqlite3.connect(str(home / "state.db"))
+    for sid, user in users.items():
+        con.execute("UPDATE sessions SET user_id = ? WHERE id = ?", (user, sid))
+    con.commit()
+    con.close()
+
+
+def _list(ctx: RecordingContext, **kwargs) -> dict:
+    plugin = _load_plugin()
+    caller = str(kwargs.pop("caller", "local-alice-0001"))
+    raw = plugin.delivery.tool_session_list(kwargs or {}, ctx=ctx, session_id=caller)
+    return json.loads(raw)
+
+
+def _shared_pair(tmp_path: Path) -> tuple[Path, RecordingContext]:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-alice-0001", "local", "m", None, 1.0, None, None, 1, "Alice notes", 0,
+         "agent:main:local:dm:local-alice-0001", 9.0),
+        ("local-alice-0002", "local", "m", None, 1.0, None, None, 1, "Alice other", 0,
+         "agent:main:local:dm:local-alice-0002", 8.0),
+        ("local-bob-000001", "telegram", "m", None, 1.0, None, None, 1, "Bob private notes", 0,
+         "agent:main:telegram:dm:bob", 20.0),
+    ])
+    con = sqlite3.connect(str(home / "state.db"))
+    con.execute("UPDATE sessions SET cwd = ? WHERE id = ?", ("/home/bob/secret", "local-bob-000001"))
+    con.commit()
+    con.close()
+    _set_users(home, {
+        "local-alice-0001": "basic:alice",
+        "local-alice-0002": "basic:alice",
+        "local-bob-000001": "basic:bob",
+    })
+    return home, RecordingContext(home)
+
+
+def test_h1_shared_profile_lists_and_messages_only_the_caller(tmp_path: Path, monkeypatch) -> None:
+    home, ctx = _shared_pair(tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "basic:bob")
+    # A tool argument must not choose the principal. The actor id beats the route user.
+    listed = _list(ctx, caller="local-alice-0001", user_id="basic:bob")
+    assert listed["ok"] is True
+    ids = [row["session_id"] for row in listed["sessions"]]
+    assert ids == ["local-alice-0001", "local-alice-0002"] or set(ids) == {
+        "local-alice-0001", "local-alice-0002",
+    }
+    assert "local-bob-000001" not in ids
+    blob = json.dumps(listed)
+    assert "Bob private notes" not in blob
+    assert "/home/bob/secret" not in blob
+    assert "basic:bob" not in blob
+
+    refused = _send(
+        ctx, target="local-bob-000001", message="hello", caller="local-alice-0001", request_id="xuser",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "cross_user_refused"
+    assert ctx.injected == []
+    assert "Bob private notes" not in json.dumps(refused)
+    assert "/home/bob/secret" not in json.dumps(refused)
+
+    by_title = _send(
+        ctx, target="Bob private notes", message="hello", caller="local-alice-0001", request_id="xtitle",
+    )
+    assert by_title["ok"] is False
+    assert by_title["error"] == "cross_user_refused"
+    assert ctx.injected == []
+
+    allowed = _send(
+        ctx, target="local-alice-0002", message="hello", caller="local-alice-0001", request_id="own",
+    )
+    assert allowed["ok"] is True
+    assert allowed["target_session_id"] == "local-alice-0002"
+    assert len(ctx.injected) == 1
+
+
+def test_h1_missing_caller_on_a_shared_profile_fails_closed(tmp_path: Path) -> None:
+    _home_unused, ctx = _shared_pair(tmp_path)
+    listed = _list(ctx, caller="local-alice-0001")
+    assert listed["ok"] is False
+    assert listed["error"] == "user_boundary"
+    assert "sessions" not in listed
+    assert "Bob private notes" not in json.dumps(listed)
+    assert "/home/bob/secret" not in json.dumps(listed)
+    refused = _send(
+        ctx, target="local-bob-000001", message="hello", caller="local-alice-0001", request_id="anon",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "user_boundary"
+    assert ctx.injected == []
+    assert "Bob private notes" not in json.dumps(refused)
+
+
+def test_h1_route_user_is_the_caller_when_actor_is_unset(tmp_path: Path, monkeypatch) -> None:
+    _home_unused, ctx = _shared_pair(tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "basic:bob")
+    listed = _list(ctx, caller="local-bob-000001")
+    assert listed["ok"] is True
+    assert [row["session_id"] for row in listed["sessions"]] == ["local-bob-000001"]
+
+
+def test_h1_one_principal_stays_a_single_owner_profile(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-alice-0001", "local", "m", None, 1.0, None, None, 1, "Alice", 0,
+         "agent:main:local:dm:local-alice-0001", 9.0),
+        ("local-anon-00001", "local", "m", None, 1.0, None, None, 1, "Anonymous", 0,
+         "agent:main:local:dm:local-anon-00001", 8.0),
+    ])
+    _set_users(home, {"local-alice-0001": "basic:alice", "local-anon-00001": None})
+    ctx = RecordingContext(home)
+    listed = _list(ctx, caller="local-alice-0001")
+    assert listed["ok"] is True
+    assert {row["session_id"] for row in listed["sessions"]} == {"local-alice-0001", "local-anon-00001"}
+
+
+def test_h1_a_failed_shared_probe_does_not_deliver(tmp_path: Path, monkeypatch) -> None:
+    """A SQLite error while reading the user boundary must not look like a single-owner profile.
+
+    lookup_exact_session used to swallow that error and leave the shared flag unset. A later
+    read could then resolve another user's session and session_send would inject it.
+    """
+    _home_unused, ctx = _shared_pair(tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    plugin = _load_plugin()
+
+    def boom(_con):
+        raise sqlite3.OperationalError("shared probe failed")
+
+    monkeypatch.setattr(plugin.store, "_multiple_users", boom)
+    refused = _send(
+        ctx, target="local-bob-000001", message="hello", caller="local-alice-0001", request_id="probe",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "store_unreadable"
+    assert ctx.injected == []
+    assert "Bob private notes" not in json.dumps(refused)
+    assert "/home/bob/secret" not in json.dumps(refused)
+
+
+def test_h1_other_users_cannot_fill_the_list_window(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path)
+    con = sqlite3.connect(str(home / "state.db"))
+    for n in range(501):
+        con.execute(
+            "INSERT INTO sessions (id, source, user_id, title, message_count, session_key, last_activity_at) "
+            "VALUES (?, 'telegram', 'basic:bob', ?, 1, ?, ?)",
+            (f"local-bob-{n:04d}", f"Bob {n}", f"agent:main:telegram:dm:bob-{n}", 1000 + n),
+        )
+    con.execute(
+        "INSERT INTO sessions (id, source, user_id, title, message_count, cwd, session_key, last_activity_at) "
+        "VALUES ('local-alice-0001', 'local', 'basic:alice', 'Alice only', 1, '/home/alice', "
+        "'agent:main:local:dm:local-alice-0001', 1.0)"
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    ctx = RecordingContext(home)
+    listed = _list(ctx, caller="local-alice-0001", limit=5)
+    assert listed["ok"] is True
+    assert [row["session_id"] for row in listed["sessions"]] == ["local-alice-0001"]
+    assert "Bob 500" not in json.dumps(listed)
+
+
+def test_h1_a_principal_committed_during_the_read_is_not_listed(tmp_path: Path, monkeypatch) -> None:
+    """The user count and the session read share one snapshot.
+
+    A second principal that commits after the count must not appear in that read.
+    """
+    home = _home(tmp_path)
+    _insert(home, [
+        ("local-alice-0001", "local", "m", None, 1.0, None, None, 1, "Alice", 0,
+         "agent:main:local:dm:local-alice-0001", 9.0),
+    ])
+    _set_users(home, {"local-alice-0001": "basic:alice"})
+    setup = sqlite3.connect(str(home / "state.db"))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.close()
+    plugin = _load_plugin()
+    real = plugin.store._multiple_users
+    writer = sqlite3.connect(str(home / "state.db"))
+    inserted = False
+
+    def gap(db):
+        nonlocal inserted
+        flag = real(db)
+        if not inserted:
+            writer.execute(
+                "INSERT INTO sessions (id, source, user_id, title, message_count, session_key, last_activity_at) "
+                "VALUES ('local-bob-000001', 'telegram', 'basic:bob', 'Bob private notes', 1, "
+                "'agent:main:telegram:dm:bob', 20.0)"
+            )
+            writer.commit()
+            inserted = True
+        return flag
+
+    monkeypatch.setattr(plugin.store, "_multiple_users", gap)
+    monkeypatch.setenv("HERMES_SESSION_ACTOR_ID", "basic:alice")
+    try:
+        listed = _list(RecordingContext(home), caller="local-alice-0001")
+    finally:
+        writer.close()
+    assert listed["ok"] is True
+    assert [row["session_id"] for row in listed["sessions"]] == ["local-alice-0001"]
+    assert "Bob private notes" not in json.dumps(listed)

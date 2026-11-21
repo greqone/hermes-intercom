@@ -12,8 +12,9 @@ SESSION_LIST_SCHEMA: dict = {
         "table, or synthesized). `routed` is true only when a real route exists — an explicit "
         "session_key or a gateway_routing row — and is false when the key was merely synthesized as "
         "`agent:<namespace>:local:dm:<session_id>`; an unverified route is refused. "
-        "A route does not guarantee that a dormant target is currently injectable. In a shared "
-        "gateway, results may include other users' chat titles; restrict the intercom toolset to owner-only platforms."
+        "A route does not guarantee that a dormant target is currently injectable. When the "
+        "profile stores more than one sessions.user_id, results are limited to the caller "
+        "identified by the host; a missing caller id returns user_boundary and lists nothing."
     ),
     "parameters": {
         "type": "object",
@@ -54,8 +55,9 @@ SESSION_SEND_SCHEMA: dict = {
         "Returns scheduled when the host accepts scheduling, not proof of execution or durable "
         "delivery. Refuses CLI/unknown sender surfaces and unverified routes. It does not mount "
         "dormant targets or bypass an injection refusal. Shows an attributed native notice in "
-        "Hermes Desktop and enforces hop, duplicate and rate guards. In a shared gateway it can "
-        "start turns in other users' chats; restrict the intercom toolset to owner-only platforms."
+        "Hermes Desktop and enforces hop, duplicate and rate guards. When the profile stores "
+        "more than one sessions.user_id, a target for a different or unknown user returns "
+        "cross_user_refused and is not injected. A missing host caller id returns user_boundary."
     ),
     "parameters": {
         "type": "object",

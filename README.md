@@ -13,7 +13,7 @@ Cross-session discovery and messaging for Hermes Agent (`>=0.22.5`).
 
 ## Shared-gateway access
 
-In a gateway serving several users in one profile, **`session_list` can show other users' chat titles and metadata, and `session_send` can start model/tool turns in their chats**. Restrict the **`intercom` toolset to owner-only platforms** using Hermes tool permissions. This plugin's profile boundary is not a per-user authorization boundary. Turns use the recipient's configured model and tool permissions.
+When `sessions.user_id` stores more than one distinct principal, `session_list` and `session_send` fail closed. The caller principal is read from the host session context (`HERMES_SESSION_ACTOR_ID`, otherwise `HERMES_SESSION_USER_ID` through `gateway.session_context.get_session_env`). Tool arguments cannot name the caller. A missing caller id returns `user_boundary` and lists nothing. A target whose `user_id` differs or is empty returns `cross_user_refused` and is not injected. A profile with no `user_id` column, or with at most one non-empty principal, stays single-owner: empty `user_id` rows are not a second user. Turns still use the recipient's configured model and tool permissions.
 
 ## Reliability and safeguards
 
@@ -21,7 +21,7 @@ In a gateway serving several users in one profile, **`session_list` can show oth
 - Duplicate detection is per sender, `expect_reply` and body (default 120 seconds). Rate limits count distinct operations from all senders to a target (default 10 per 600 seconds).
 - A caller-supplied `request_id` identifies one operation in the current process. While retained, repeating an accepted operation returns its original result without reinjection, including verified sender/target compression continuations. Different bodies or unrelated sessions conflict; resets, branches and delegates do not inherit identity. IDs cannot contain whitespace, controls or lone surrogates.
 - Retry memory is capped at 4096 operations. Active calls are protected; completed entries can be evicted under capacity pressure. Restart or eviction loses replay protection. **There is no exactly-once or durable-delivery guarantee.** Check target history before resending after either. Retention of the removed WebSocket transport's 120-second uncertain receipts is no longer part of this build.
-- An original target ID prefix may stop resolving after compression (R7-D01). For a retained retry use the exact `target_session_id` returned by the first result with the same `request_id`, body and `expect_reply`; do not create a new operation to recover an uncertain delivery.
+- An original target ID prefix may stop resolving after compression (R7-D01). That prefix is never resolved through a title that merely contains it. For a retained retry use the exact `target_session_id` returned by the first result with the same `request_id`, body and `expect_reply`; do not create a new operation to recover an uncertain delivery.
 - Compression traversal is bounded to 256 identities. Cycles, bounds and reset/branch/delegate boundaries fail closed. Route preflight and host scheduling are not an atomic transaction; later host failures are visible in Hermes logs rather than a durable receipt here.
 
 ## Host API and data access
