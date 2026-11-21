@@ -53,6 +53,7 @@ _SESSION_OPTIONAL_COLUMNS = (
     "hidden",
     "session_key",
     "last_activity_at",
+    "user_id",
 )
 
 # End reasons that mark a session segment as a superseded compression ancestor.
@@ -74,6 +75,10 @@ _AUTOMATIC_END_REASONS = frozenset({
 
 class StoreReadError(RuntimeError):
     """state.db exists but could not be read. Distinct from an empty result."""
+
+
+class UserBoundaryError(RuntimeError):
+    """A shared profile has no caller principal, so no session may be disclosed."""
 
 
 def resolve_home(ctx: Any = None) -> Path:
@@ -102,6 +107,49 @@ def calling_session_key() -> str:
         return get_session_env("HERMES_SESSION_KEY", "") or ""
     except Exception:
         return ""
+
+
+def calling_user_id() -> str:
+    """Principal of the person who asked this turn, from the host session context.
+
+    ``HERMES_SESSION_ACTOR_ID`` is who asked. ``HERMES_SESSION_USER_ID`` is the session
+    route and is used only when the actor id is empty; on a 1:1 chat it is the same
+    principal ``sessions.user_id`` stores. Empty means the host named nobody, which
+    fails closed on a shared profile. Tool arguments are never read.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return ""
+    actor = str(get_session_env("HERMES_SESSION_ACTOR_ID", "") or "").strip()
+    if actor:
+        return actor
+    return str(get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+
+
+def _principal(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _multiple_users(con: sqlite3.Connection) -> bool:
+    """True when ``sessions.user_id`` holds more than one distinct non-empty principal."""
+    columns = {name.lower() for name in _column_names(con, "sessions")}
+    if "user_id" not in columns:
+        return False
+    row = con.execute(
+        "SELECT COUNT(*) AS n FROM ("
+        " SELECT DISTINCT TRIM(user_id) AS principal FROM sessions"
+        " WHERE user_id IS NOT NULL AND TRIM(user_id) != ''"
+        ")"
+    ).fetchone()
+    return _safe_int(_row_get(row, "n") if row is not None else 0, 0) > 1
+
+
+def session_owned_by(item: dict[str, Any], caller_user_id: str) -> bool:
+    """True when ``item``'s stored principal is the caller's and neither is empty."""
+    caller = _principal(caller_user_id)
+    owner = _principal(item.get("_user_id"))
+    return bool(caller) and owner == caller
 
 
 def sanitize_utf8_text(text: str) -> str:
@@ -320,6 +368,7 @@ def query_sessions(
     limit: int = 20,
     include_cron: bool = False,
     include_archived: bool = False,
+    caller_user_id: str | None = None,
     _max_limit: int = 100,
     _with_internal: bool = False,
 ) -> list[dict[str, Any]]:
@@ -329,6 +378,12 @@ def query_sessions(
     materializes every row, and every optional column is projected as ``NULL`` when absent.
     ``_with_internal`` adds the private ``_archived``/``_cron``/``_active`` markers used by
     :func:`resolve_target`; they never reach tool output.
+
+    Pass ``caller_user_id`` (including ``""``) to enforce the per-user boundary. When the
+    profile has more than one principal and the caller id is empty, this raises
+    :class:`UserBoundaryError` instead of returning rows. A known caller sees only
+    sessions whose ``user_id`` equals that principal. ``None`` leaves the boundary to
+    the caller (the resolver still returns every match).
     """
     db_path = Path(home) / "state.db"
     if not db_path.is_file():
@@ -352,6 +407,11 @@ def query_sessions(
         if "id" not in colset:
             return []
         sid_to_key, _key_to_entry = _load_routing_map(con, home)
+        bound_principal = ""
+        if caller_user_id is not None and _multiple_users(con):
+            bound_principal = _principal(caller_user_id)
+            if not bound_principal:
+                raise UserBoundaryError("shared profile has no caller principal")
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
         if "parent_session_id" in colset and "end_reason" in colset:
             select_list += (
@@ -403,9 +463,15 @@ def query_sessions(
                 where_parts.append("COALESCE(archived, 0) = 0")
             if "hidden" in colset:
                 where_parts.append("COALESCE(hidden, 0) = 0")
+        sql_params: list[Any] = []
+        if bound_principal and "user_id" in colset:
+            # Before LIMIT, so another user's recent rows cannot fill the window.
+            where_parts.append("TRIM(user_id) = ?")
+            sql_params.append(bound_principal)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         rows = con.execute(
-            f"SELECT {select_list} FROM sessions{where_sql}{order} LIMIT ?", (sql_limit,)
+            f"SELECT {select_list} FROM sessions{where_sql}{order} LIMIT ?",
+            (*sql_params, sql_limit),
         ).fetchall()
     except sqlite3.Error as exc:
         raise StoreReadError(str(exc)) from exc
@@ -479,7 +545,10 @@ def query_sessions(
             "_active": item_active,
             "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
             "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
+            "_user_id": _principal(_row_get(r, "user_id")),
         }
+        if bound_principal and not session_owned_by(item, bound_principal):
+            continue
 
         dedup_key = skey or sid
         rank = (item_active, last_active)
@@ -744,11 +813,13 @@ def _row_to_session(r, sid_to_key, *, ns, caller_session_id, caller_session_key)
         "_active": ended_at is None or ended_at == "",
         "_end_reason": str(_row_get(r, "end_reason") or "").strip().lower(),
         "_parent_end_reason": str(_row_get(r, "parent_end_reason") or "").strip().lower(),
+        "_user_id": _principal(_row_get(r, "user_id")),
     }
 
 
 def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
-                         caller_session_id: str = "", caller_session_key: str = "") -> dict[str, Any] | None:
+                         caller_session_id: str = "", caller_session_key: str = "",
+                         _shared: list[bool] | None = None) -> dict[str, Any] | None:
     """Resolve one exact session id or session_key with a single indexed read.
 
     ``query_sessions`` only scans the most recent rows, so an old session would otherwise be
@@ -763,6 +834,10 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
+        if _shared is not None and not _shared:
+            # Same connection the exact read already holds. A second open would move
+            # a later routing failure in front of the claim (R5-D03).
+            _shared.append(_multiple_users(con))
         if "id" not in colset:
             return None
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
@@ -814,6 +889,19 @@ def lookup_exact_session(home: Path, needle: str, *, ns: str = "main",
     return built
 
 
+def _id_or_key_has_prefix(session_id: str, session_key: str, needle_low: str) -> bool:
+    """True when ``needle_low`` prefixes the row id or the id embedded in its gateway key.
+
+    This is an identity match, not a title match. It does not by itself address a
+    compression successor: a shortened original id stops resolving after compression
+    (R7-D01) and must not cross a reset (S-R01). It does stop a title from winning.
+    """
+    if not needle_low or not _store_looks_like_id(needle_low):
+        return False
+    embedded = _root_from_key(session_key)
+    return any(value.lower().startswith(needle_low) for value in (session_id, embedded) if value)
+
+
 def _store_looks_like_id(needle_low: str) -> bool:
     """True only for the id shapes this plugin resolves: ``local-``, ``cron_`` or a hex token.
 
@@ -827,8 +915,12 @@ def _store_looks_like_id(needle_low: str) -> bool:
 
 def _scan_title_and_prefix(
     home: Path, needle: str, needle_low: str, *, ns: str, caller_session_id: str, caller_session_key: str
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """Every active-or-not row whose id prefix or title matches ``needle``.
+
+    The third value is true when the needle prefixes a row id or the id embedded in
+    its ``:local:dm:`` key, including a compression ancestor the row builder skips.
+    That shadow is not a selected session. It only blocks the title tier.
 
     ``query_sessions`` stops at 10000 raw rows, so a second match past that window
     would make the first look unique. This reads the whole table but only keeps
@@ -836,18 +928,19 @@ def _scan_title_and_prefix(
     """
     db_path = Path(home) / "state.db"
     if not needle or not db_path.is_file():
-        return [], []
+        return [], [], False
     want_prefix = len(needle_low) >= MIN_ID_PREFIX_LEN
     con: sqlite3.Connection | None = None
     prefix_hits: list[dict[str, Any]] = []
     title_hits: list[dict[str, Any]] = []
     seen_prefix: set[str] = set()
     seen_title: set[str] = set()
+    root_shadow = False
     try:
         con = _connect_ro(db_path)
         colset = {c.lower() for c in _column_names(con, "sessions")}
         if "id" not in colset:
-            return [], []
+            return [], [], False
         sid_to_key, _entries = _load_routing_map(con, home)
         select_list = "id, " + _projection(colset, _SESSION_OPTIONAL_COLUMNS)
         if "parent_session_id" in colset and "end_reason" in colset:
@@ -862,8 +955,9 @@ def _scan_title_and_prefix(
             clauses.append("lower(id) LIKE ? ESCAPE '\\'")
             params.append(escaped + "%")
             if "session_key" in colset:
-                # root_session_id is the trailing segment of a ``:local:dm:`` key, so a prefix of it
-                # never matched a row whose own id differs (S04).
+                # Used only when there is no title column. With a title column the scan below
+                # drops this predicate and classifies the embedded id in Python, as a shadow
+                # that blocks the title tier rather than as a selected successor.
                 clauses.append("lower(COALESCE(session_key, '')) LIKE ? ESCAPE '\\'")
                 params.append("%:local:dm:" + escaped + "%")
         if "title" in colset:
@@ -871,18 +965,26 @@ def _scan_title_and_prefix(
             # the uppercase title before Python ever ranked it (S02). A prefix predicate is worse:
             # a title such as ``local-topic`` never matches ``lower(id) LIKE 'local-topic%'``, so
             # the row was discarded before the title fold ran. Title matching reads the rows.
+            # Id, root and key prefixes are classified in Python and are not discarded with the
+            # SQL clauses, so a root-id prefix still beats a title that merely contains it.
             title_scan = True
             clauses = []
             params = []
         else:
             title_scan = False
         if not clauses and not title_scan:
-            return [], []
+            return [], [], False
         where_sql = (" WHERE " + " OR ".join(clauses)) if clauses else ""
         rows = con.execute(
             f"SELECT {select_list} FROM sessions{where_sql}", tuple(params)
         )
         for row in rows:
+            raw_sid = str(_row_get(row, "id") or "")
+            raw_key = sid_to_key.get(raw_sid, "") or str(_row_get(row, "session_key") or "").strip()
+            if want_prefix and _id_or_key_has_prefix(raw_sid, raw_key, needle_low):
+                # Kept even when the row is a compression ancestor or a reset successor.
+                # The successor is not selected, and the title tier does not run.
+                root_shadow = True
             built = _row_to_session(
                 row, sid_to_key, ns=ns, caller_session_id=caller_session_id,
                 caller_session_key=caller_session_key,
@@ -902,7 +1004,7 @@ def _scan_title_and_prefix(
     finally:
         if con is not None:
             con.close()
-    return prefix_hits, title_hits
+    return prefix_hits, title_hits, root_shadow
 
 
 def resolve_target(
@@ -912,6 +1014,7 @@ def resolve_target(
     ns: str = "main",
     caller_session_id: str = "",
     caller_session_key: str = "",
+    _shared: list[bool] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Resolve a target string to one session (or an ambiguity list).
 
@@ -920,7 +1023,9 @@ def resolve_target(
     matches come from the whole table, not the recency window, so a second match past that
     window stays visible. An id prefix is never beaten by a title, so a chat titled ``local-ab``
     cannot hijack the prefix ``local-ab...``, and an archived chat with the same title never
-    blocks the active one.
+    blocks the active one. A prefix of the id embedded in a gateway key is the same kind of
+    identity: it blocks that title even when compression has stopped the shortened id from
+    selecting the live successor.
     """
     needle = (target or "").strip()
     if not needle:
@@ -929,7 +1034,7 @@ def resolve_target(
 
     direct = lookup_exact_session(
         home, needle, ns=ns, caller_session_id=caller_session_id,
-        caller_session_key=caller_session_key,
+        caller_session_key=caller_session_key, _shared=_shared,
     )
     if direct is not None and needle_low in (
         direct["session_id"].lower(), direct["root_session_id"].lower(), direct["session_key"].lower()
@@ -984,7 +1089,7 @@ def resolve_target(
             return active_exact[0], []
         return None, (active_exact or exact_id)[:8]
 
-    prefix_hits, title_hits = _scan_title_and_prefix(
+    prefix_hits, title_hits, root_shadow = _scan_title_and_prefix(
         home, needle, needle_low, ns=ns, caller_session_id=caller_session_id,
         caller_session_key=caller_session_key,
     )
@@ -1013,6 +1118,12 @@ def resolve_target(
         if len(collapsed) == 1:
             return collapsed[0], []
         return None, (collapsed or prefix_hits)[:8]
+
+    if root_shadow:
+        # The needle prefixes a session id or the id carried in its key. That is not a
+        # title, and it is not retargeted onto a compression successor (R7-D01) or across
+        # a reset (S-R01).
+        return None, []
 
     # Tier 3 - title: exact title first, then substring, active before archived, never cron.
     non_cron = [s for s in title_hits if not s.get("_cron")]

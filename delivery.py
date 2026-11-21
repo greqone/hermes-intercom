@@ -380,19 +380,30 @@ def tool_session_list(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     home = store.resolve_home(ctx)
     ns = store.profile_namespace(ctx)
     caller_key = store.calling_session_key()
+    caller_user = store.calling_user_id()
 
     try:
         sessions = store.query_sessions(
             home,
             ns=ns,
-        caller_session_id=str(session_id or ""),
-        caller_session_key=caller_key,
-        query=str(query_arg or ""),
-        source=str(source_arg or ""),
-        limit=_pos_int(params.get("limit"), 20, minimum=1, maximum=100),
-        include_cron=_parse_bool(params.get("include_cron", False), False),
-        include_archived=_parse_bool(params.get("include_archived", False), False),
+            caller_session_id=str(session_id or ""),
+            caller_session_key=caller_key,
+            caller_user_id=caller_user,
+            query=str(query_arg or ""),
+            source=str(source_arg or ""),
+            limit=_pos_int(params.get("limit"), 20, minimum=1, maximum=100),
+            include_cron=_parse_bool(params.get("include_cron", False), False),
+            include_archived=_parse_bool(params.get("include_archived", False), False),
         )
+    except store.UserBoundaryError:
+        return _json({
+            "ok": False,
+            "error": "user_boundary",
+            "message": (
+                "This profile has more than one user and the host did not identify the caller. "
+                "No sessions were listed."
+            ),
+        })
     except store.StoreReadError:
         return _json({
             "ok": False,
@@ -565,6 +576,7 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
     home = store.resolve_home(ctx)
     ns = store.profile_namespace(ctx)
     caller_key = store.calling_session_key()
+    caller_user = store.calling_user_id()
     caller_sid = str(session_id or "").strip()
     if not caller_sid and caller_key and ":local:dm:local-" in caller_key:
         # Recover the caller id from its gateway key so the hop guard still applies (W204).
@@ -584,13 +596,15 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "message": "request_id must be 1-1024 characters with no whitespace.",
         })
 
+    shared_box: list[bool] = []
     try:
         resolved, candidates = store.resolve_target(
-        home,
-        target_arg,
-        ns=ns,
-        caller_session_id=caller_sid,
-        caller_session_key=caller_key,
+            home,
+            target_arg,
+            ns=ns,
+            caller_session_id=caller_sid,
+            caller_session_key=caller_key,
+            _shared=shared_box,
         )
     except store.StoreReadError:
         return _json({
@@ -598,6 +612,34 @@ def tool_session_send(args: dict[str, Any] | None, *, ctx: Any = None, session_i
             "error": "store_unreadable",
             "message": "state.db exists but could not be read, so the target was not resolved.",
         })
+    shared_profile = bool(shared_box and shared_box[0])
+    if shared_profile and not caller_user:
+        return _json({
+            "ok": False,
+            "error": "user_boundary",
+            "message": (
+                "This profile has more than one user and the host did not identify the caller. "
+                "Nothing was sent."
+            ),
+        })
+    if shared_profile:
+        # Refuse before any candidate title, cwd or route key is copied into the result.
+        # A unique match that belongs to someone else is not replaced with a later title hit.
+        if resolved is not None and not store.session_owned_by(resolved, caller_user):
+            return _json({
+                "ok": False,
+                "error": "cross_user_refused",
+                "message": "The target belongs to a different user. Nothing was sent.",
+            })
+        if resolved is None and candidates:
+            own = [item for item in candidates if store.session_owned_by(item, caller_user)]
+            if not own:
+                return _json({
+                    "ok": False,
+                    "error": "cross_user_refused",
+                    "message": "The target belongs to a different user. Nothing was sent.",
+                })
+            candidates = own
     if resolved is None:
         return _json(
             {
