@@ -1,5 +1,5 @@
 name: hermes-intercom
-version: 0.1.1
+version: 0.1.2
 description: >
   Cross-session discovery and messaging within one Hermes profile. Reads a
   schema-tolerant state.db and sends attributed messages exclusively through

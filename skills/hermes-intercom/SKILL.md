@@ -1,7 +1,7 @@
 ---
 name: hermes-intercom
 description: Use when discovering or messaging other Hermes sessions.
-version: 0.1.1
+version: 0.1.2
 author: GreQ, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
